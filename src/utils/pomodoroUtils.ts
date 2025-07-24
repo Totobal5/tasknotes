@@ -36,3 +36,42 @@ export function getSessionDuration(session: any): number {
     
     return 0;
 }
+
+export const timerWorker = `
+  let timerInterval;
+
+  self.onmessage = function(e) {
+    const { command, duration } = e.data;
+
+    if (command === 'start') {
+      if (timerInterval) {
+        clearInterval(timerInterval);
+      }
+
+      let timeRemaining = duration;
+      timerInterval = setInterval(() => {
+        timeRemaining--;
+        // Notificar al hilo principal cada segundo para actualizar la UI
+        self.postMessage({ type: 'tick', timeRemaining: timeRemaining });
+
+        if (timeRemaining <= 0) {
+          self.postMessage({ type: 'done' });
+          clearInterval(timerInterval);
+          timerInterval = null;
+        }
+      }, 1000);
+
+    } else if (command === 'stop') {
+      if (timerInterval) {
+        clearInterval(timerInterval);
+        timerInterval = null;
+      }
+    }
+  };
+`;
+
+export function formatSeconds(seconds: number): string {
+    const mm = Math.floor(seconds / 60);
+    const ss = seconds % 60;
+    return `${mm.toString().padStart(2, '0')}:${ss.toString().padStart(2, '0')}`;
+}

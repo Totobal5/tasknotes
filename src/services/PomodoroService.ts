@@ -19,40 +19,8 @@ import {
     TaskInfo
 } from '../types';
 import { getCurrentTimestamp } from '../utils/dateUtils';
-import { getSessionDuration } from '../utils/pomodoroUtils';
+import { getSessionDuration, timerWorker, formatSeconds } from '../utils/pomodoroUtils';
 
-const timerWorkerCode = `
-  let timerInterval;
-
-  self.onmessage = function(e) {
-    const { command, duration } = e.data;
-
-    if (command === 'start') {
-      if (timerInterval) {
-        clearInterval(timerInterval);
-      }
-
-      let timeRemaining = duration;
-      timerInterval = setInterval(() => {
-        timeRemaining--;
-        // Notificar al hilo principal cada segundo para actualizar la UI
-        self.postMessage({ type: 'tick', timeRemaining: timeRemaining });
-
-        if (timeRemaining <= 0) {
-          self.postMessage({ type: 'done' });
-          clearInterval(timerInterval);
-          timerInterval = null;
-        }
-      }, 1000);
-
-    } else if (command === 'stop') {
-      if (timerInterval) {
-        clearInterval(timerInterval);
-        timerInterval = null;
-      }
-    }
-  };
-`;
 
 export class PomodoroService {
     private plugin: TaskNotesPlugin;
@@ -65,12 +33,13 @@ export class PomodoroService {
         this.plugin = plugin;
         this.state = {
             isRunning: false,
-            timeRemaining: plugin.settings.pomodoroWorkDuration * 60 // Default work duration in seconds
+            // Default work duration in seconds
+            timeRemaining: plugin.settings.pomodoroWorkDuration * 60
         };
     }
 
     private setupWorker() {
-        const blob = new Blob([timerWorkerCode], { type: 'application/javascript' });
+        const blob = new Blob([timerWorker], { type: 'application/javascript' });
         const workerUrl = URL.createObjectURL(blob);
         this.timerWorker = new Worker(workerUrl);
 
@@ -86,21 +55,20 @@ export class PomodoroService {
                   timeRemaining: this.state.timeRemaining,
                   session: this.state.currentSession 
               });
+
+              console.log("Timer tick:", this.state.timeRemaining, "seconds remaining", "minutes remaining:", Math.floor(this.state.timeRemaining / 60));
             }
         };
     }
 
     async initialize() {
-        debugger;
-
-
         await this.loadState();
         this.setupWorker();
         
         if (this.state.isRunning && this.state.currentSession) {
             const now = Date.now();
             let totalActiveSeconds = 0;
-
+            
             this.state.currentSession.activePeriods.forEach(period => {
                 const start = new Date(period.startTime).getTime();
                 const end = period.endTime ? new Date(period.endTime).getTime() : now;
@@ -213,15 +181,20 @@ export class PomodoroService {
             return;
         }
         
-        // Validate duration settings
-        const duration = Math.max(60, this.state.timeRemaining);
+        // Validate duration settings (in seconds)
+        const durationSeconds = Math.max(60, this.state.timeRemaining);
+        // Pasarlo a minutos para el plannedDuration
+        const plannedDurationMinutes = durationSeconds / 60;
+
+        console.log("Starting pomodoro with planned duration:", plannedDurationMinutes, "minutes");
 
         const sessionStartTime = getCurrentTimestamp();
+
         const session: PomodoroSession = {
             id: Date.now().toString(),
             taskPath: task?.path,
             startTime: sessionStartTime,
-            plannedDuration: duration,
+            plannedDuration: plannedDurationMinutes,
             type: 'work',
             completed: false,
             activePeriods: [{
@@ -229,12 +202,17 @@ export class PomodoroService {
                 // endTime will be set when paused or completed
             }]
         };
-
+        
         this.state.currentSession = session;
         this.state.isRunning = true;
-        this.state.nextSessionType = undefined; // Clear next session type since we're starting a session
+        this.state.timeRemaining = durationSeconds;
 
+        // Clear next session type since we're starting a session
+        this.state.nextSessionType = undefined;
+
+        // Save state before starting the timer
         await this.saveState();
+
         this.startTimer();
         
         // Start time tracking on the task if applicable
@@ -249,8 +227,9 @@ export class PomodoroService {
             }
         }
         
+        // Notify the user and trigger event
         this.plugin.emitter.trigger(EVENT_POMODORO_START, { session, task });
-        new Notice(`Pomodoro started${task ? ` for: ${task.title}` : ''}`);
+        new Notification(`Pomodoro started${task ? ` for: ${task.title}` : ''}`);
     }
 
     async startBreak(isLongBreak = false) {
@@ -266,15 +245,15 @@ export class PomodoroService {
         }
 
         // Validate duration settings
-        const duration = isLongBreak 
+        const durationMinutes = isLongBreak 
             ? Math.max(1, Math.min(60, this.plugin.settings.pomodoroLongBreakDuration))
             : Math.max(1, Math.min(30, this.plugin.settings.pomodoroShortBreakDuration));
-
         const sessionStartTime = getCurrentTimestamp();
+
         const session: PomodoroSession = {
             id: Date.now().toString(),
             startTime: sessionStartTime,
-            plannedDuration: duration,
+            plannedDuration: durationMinutes,
             type: isLongBreak ? 'long-break' : 'short-break',
             completed: false,
             activePeriods: [{
@@ -563,9 +542,13 @@ export class PomodoroService {
         // Show notification
         if (this.plugin.settings.pomodoroNotifications) {
             const message = session.type === 'work' 
-                ? `Pomodoro completed! Time for a ${shouldTakeLongBreak ? 'long' : 'short'} break.`
-                : 'Break completed! Ready for the next pomodoro?';
-            new Notification(message);
+                ? `🍅 Pomodoro completed!`
+                : '☕ Break completed!';
+            const body = session.type === 'work'
+                ? `Time for a ${shouldTakeLongBreak ? 'long break 💤' : 'short break ☕'}`
+                : 'Ready for the next pomodoro?';
+
+            new Notification(message, { body });
         }
 
         // Play sound if enabled
@@ -612,7 +595,7 @@ export class PomodoroService {
         });
     }
 
-    private playCompletionSound() {
+    private playCompletionSound(): void {
         try {
             // Create a simple beep sound
             const audioContext = new (window.AudioContext || (window as Window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext)();
@@ -661,62 +644,54 @@ export class PomodoroService {
     }
 
     // Public getters
-    getState(): PomodoroState {
+    public getState(): PomodoroState {
         return { ...this.state };
     }
 
-
-    adjustSessionTime(adjustmentSeconds: number): void {
+    public adjustSessionTime(adjustmentSeconds: number): void {
         if (this.state.currentSession) {
-            debugger;
-
-            // Stop timer.
             this.stopTimer();
+            
+            // To seconds.
+            const originalPlannedDuration = this.state.currentSession.plannedDuration * 60;
+            let newTimeRemaining = Math.max(1, this.state.timeRemaining + adjustmentSeconds);
 
-            // Apply the adjustment directly to timeRemaining
-            this.state.timeRemaining = Math.max(1, this.state.timeRemaining + adjustmentSeconds);
-
-            // Calculate the new total duration based on how much time has actually elapsed
-            const activePeriods = this.state.currentSession.activePeriods || [];
-            let totalActiveSeconds = 0;
-
-            for (const period of activePeriods) {
-                if (period.endTime) {
-                    // Completed period
-                    const start = new Date(period.startTime).getTime();
-                    const end = new Date(period.endTime).getTime();
-                    totalActiveSeconds += Math.floor((end - start) / 1000);
-                } else if (this.state.isRunning) {
-                    // Current running period
-                    const start = new Date(period.startTime).getTime();
-                    const now = Date.now();
-                    totalActiveSeconds += Math.floor((now - start) / 1000);
-
-                    console.log("activeSeconds:", totalActiveSeconds);
-                }
+            // If the user tries to adjust the time beyond the original planned duration,
+            if ((originalPlannedDuration - this.state.timeRemaining + newTimeRemaining) > originalPlannedDuration) {
+                // New planned duration is the time elapsed plus the new remaining time
+                const timeElapsed = originalPlannedDuration - this.state.timeRemaining;
+                const newPlannedDuration = (timeElapsed + newTimeRemaining) / 60;
+                this.state.currentSession.plannedDuration = newPlannedDuration;
+            } else {
+                // timeRemaining should not exceed original planned duration
+                newTimeRemaining = Math.min(newTimeRemaining, originalPlannedDuration);
             }
 
-            // New planned duration = elapsed time + remaining time
-            const newTotalSeconds = totalActiveSeconds + this.state.timeRemaining;
-            // Convert to minutes.
-            this.state.currentSession.plannedDuration = newTotalSeconds / 60;
-            
-            console.log("duracion:", this.state.currentSession.plannedDuration);
+            this.state.timeRemaining = newTimeRemaining;
 
             this.saveState();
             this.startTimer();
+
+            this.plugin.emitter.trigger(EVENT_POMODORO_TICK, { 
+                timeRemaining: this.state.timeRemaining,
+                session: this.state.currentSession 
+            });
         }
     }
 
-    adjustPreparedTimer(newTimeInSeconds: number): void {
-        // Esta función solo debe funcionar si no hay una sesión activa.
+    public adjustPreparedTimer(newTimeInSeconds: number): void {
+        // If there's a current session, we should not adjust the prepared timer
         if (!this.state.currentSession) {
+            // Stop the timer if it's running
             this.stopTimer();
-            
-            this.state.timeRemaining = newTimeInSeconds;
+
+            // Max the time to ensure it's at least 1 minute
+            this.state.timeRemaining = Math.max(60, newTimeInSeconds);
             this.saveState();
             
-            // Emitir evento para actualizar la UI
+            console.log("Adjusted prepared timer to:", this.state.timeRemaining, "seconds");
+
+            // Trigger tick event to update UI
             this.plugin.emitter.trigger(EVENT_POMODORO_TICK, {
                 timeRemaining: this.state.timeRemaining,
                 session: this.state.currentSession
@@ -724,19 +699,19 @@ export class PomodoroService {
         }
     }
 
-    isRunning(): boolean {
+    public isRunning(): boolean {
         return this.state.isRunning;
     }
 
-    getCurrentSession(): PomodoroSession | undefined {
+    public getCurrentSession(): PomodoroSession | undefined {
         return this.state.currentSession;
     }
 
-    getTimeRemaining(): number {
+    public getTimeRemaining(): number {
         return this.state.timeRemaining;
     }
 
-    async getPomodorosCompleted(): Promise<number> {
+    public async getPomodorosCompleted(): Promise<number> {
         const stats = await this.getTodayStats();
         return stats.pomodorosCompleted;
     }

@@ -607,10 +607,10 @@ export class PomodoroView extends ItemView {
     
     private updateProgress(state: PomodoroState) {
         if (!this.progressCircle) return;
-        
+
         const radius = 140;
         const circumference = 2 * Math.PI * radius;
-        
+
         if (!state.currentSession) {
             // No session active - show full circle (ready to start)
             this.progressCircle.setAttributeNS(null, 'stroke-dashoffset', circumference.toString());
@@ -620,46 +620,25 @@ export class PomodoroView extends ItemView {
             this.progressCircle.removeClass('pomodoro-view__progress-circle--warning');
             return;
         }
-        
-        // Calculate progress based on actual active time (accounting for pauses)
-        const activePeriods = state.currentSession.activePeriods || [];
-        let totalActiveSeconds = 0;
-        
-        // Sum up all completed active periods
-        for (const period of activePeriods) {
-            if (period.endTime) {
-                // Completed period
-                const start = new Date(period.startTime).getTime();
-                const end = new Date(period.endTime).getTime();
-                totalActiveSeconds += Math.floor((end - start) / 1000);
-            } else if (state.isRunning) {
-                // Current running period
-                const start = new Date(period.startTime).getTime();
-                const now = Date.now();
-                totalActiveSeconds += Math.floor((now - start) / 1000);
-            }
-        }
-        
-        // Use current planned duration (which gets updated when user adjusts time) to seconds.
-        const totalDuration = state.currentSession.plannedDuration * 60;
-        
-        // Progress based on actual active time vs current planned duration
-        const progress = Math.max(0, Math.min(1, totalActiveSeconds / totalDuration));
-        
-        console.log("Progreso:", progress);
-        
+
+        // Time calculations
+        const totalDuration = state.currentSession.plannedDuration * 60; // Convert minutes to seconds
+        const timeRemaining = Math.max(0, state.timeRemaining);
+        const timeElapsed = Math.max(0, totalDuration - timeRemaining);
+        const progress = Math.max(0, Math.min(1, timeElapsed / totalDuration));
+
         // Calculate stroke-dashoffset (progress goes clockwise)
         const offset = circumference - (progress * circumference);
-        
+
         // Update progress circle
         this.progressCircle.setAttributeNS(null, 'stroke-dashoffset', offset.toString());
-        
+
         // Update color based on session type
         this.progressCircle.removeClass('pomodoro-view__progress-circle--work');
         this.progressCircle.removeClass('pomodoro-view__progress-circle--short-break');
         this.progressCircle.removeClass('pomodoro-view__progress-circle--long-break');
         this.progressCircle.addClass(`pomodoro-view__progress-circle--${state.currentSession.type}`);
-        
+
         // Add warning class for last minute
         if (state.timeRemaining <= 60 && state.timeRemaining > 0) {
             this.progressCircle.addClass('pomodoro-view__progress-circle--warning');
