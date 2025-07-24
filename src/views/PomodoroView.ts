@@ -640,11 +640,13 @@ export class PomodoroView extends ItemView {
             }
         }
         
-        // Use current planned duration (which gets updated when user adjusts time)
+        // Use current planned duration (which gets updated when user adjusts time) to seconds.
         const totalDuration = state.currentSession.plannedDuration * 60;
         
         // Progress based on actual active time vs current planned duration
         const progress = Math.max(0, Math.min(1, totalActiveSeconds / totalDuration));
+        
+        console.log("Progreso:", progress);
         
         // Calculate stroke-dashoffset (progress goes clockwise)
         const offset = circumference - (progress * circumference);

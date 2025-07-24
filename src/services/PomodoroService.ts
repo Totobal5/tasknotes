@@ -21,13 +21,45 @@ import {
 import { getCurrentTimestamp } from '../utils/dateUtils';
 import { getSessionDuration } from '../utils/pomodoroUtils';
 
+const timerWorkerCode = `
+  let timerInterval;
+
+  self.onmessage = function(e) {
+    const { command, duration } = e.data;
+
+    if (command === 'start') {
+      if (timerInterval) {
+        clearInterval(timerInterval);
+      }
+
+      let timeRemaining = duration;
+      timerInterval = setInterval(() => {
+        timeRemaining--;
+        // Notificar al hilo principal cada segundo para actualizar la UI
+        self.postMessage({ type: 'tick', timeRemaining: timeRemaining });
+
+        if (timeRemaining <= 0) {
+          self.postMessage({ type: 'done' });
+          clearInterval(timerInterval);
+          timerInterval = null;
+        }
+      }, 1000);
+
+    } else if (command === 'stop') {
+      if (timerInterval) {
+        clearInterval(timerInterval);
+        timerInterval = null;
+      }
+    }
+  };
+`;
+
 export class PomodoroService {
     private plugin: TaskNotesPlugin;
-    private timerInterval: number | null = null;
+    private timerWorker: Worker | null = null;
     private state: PomodoroState;
     private activeAudioContexts: Set<AudioContext> = new Set();
     private cleanupTimeouts: Set<number> = new Set();
-    private visibilityChangeHandler: (() => void) | null = null;
 
     constructor(plugin: TaskNotesPlugin) {
         this.plugin = plugin;
@@ -37,22 +69,55 @@ export class PomodoroService {
         };
     }
 
-    async initialize() {
-        await this.loadState();
-        
-        // Resume timer if it was running
-        if (this.state.isRunning && this.state.currentSession) {
-            this.resumeTimer();
-        }
-        
-        // Listen for visibility changes to handle app suspension/resume
-        this.visibilityChangeHandler = () => {
-            if (!document.hidden && this.state.isRunning && this.state.currentSession) {
-                // App became visible again, check if timer needs adjustment
-                this.resumeTimer();
+    private setupWorker() {
+        const blob = new Blob([timerWorkerCode], { type: 'application/javascript' });
+        const workerUrl = URL.createObjectURL(blob);
+        this.timerWorker = new Worker(workerUrl);
+
+        this.timerWorker.onmessage = (e) => {
+            if (e.data.type === 'done') {
+                this.completePomodoro();
+            }
+
+            if (e.data.type === 'tick') {
+              this.state.timeRemaining = e.data.timeRemaining;
+
+              this.plugin.emitter.trigger(EVENT_POMODORO_TICK, { 
+                  timeRemaining: this.state.timeRemaining,
+                  session: this.state.currentSession 
+              });
             }
         };
-        this.plugin.registerDomEvent(document, 'visibilitychange', this.visibilityChangeHandler);
+    }
+
+    async initialize() {
+        debugger;
+
+
+        await this.loadState();
+        this.setupWorker();
+        
+        if (this.state.isRunning && this.state.currentSession) {
+            const now = Date.now();
+            let totalActiveSeconds = 0;
+
+            this.state.currentSession.activePeriods.forEach(period => {
+                const start = new Date(period.startTime).getTime();
+                const end = period.endTime ? new Date(period.endTime).getTime() : now;
+                totalActiveSeconds += Math.floor((end - start) / 1000);
+            });
+            
+            const totalDuration = this.state.currentSession.plannedDuration * 60;
+            const newTimeRemaining = Math.max(0, totalDuration - totalActiveSeconds);
+
+            if (newTimeRemaining > 0) {
+                this.state.timeRemaining = newTimeRemaining;
+                this.startTimer();
+            } else {
+                // Si el tiempo ya se cumplió mientras estaba cerrado, completarlo.
+                this.completePomodoro();
+            }
+        }
     }
 
     async loadState() {
@@ -149,7 +214,7 @@ export class PomodoroService {
         }
         
         // Validate duration settings
-        const duration = Math.max(1, Math.min(120, this.plugin.settings.pomodoroWorkDuration));
+        const duration = Math.max(60, this.state.timeRemaining);
 
         const sessionStartTime = getCurrentTimestamp();
         const session: PomodoroSession = {
@@ -167,7 +232,6 @@ export class PomodoroService {
 
         this.state.currentSession = session;
         this.state.isRunning = true;
-        this.state.timeRemaining = session.plannedDuration * 60; // Convert to seconds
         this.state.nextSessionType = undefined; // Clear next session type since we're starting a session
 
         await this.saveState();
@@ -231,7 +295,7 @@ export class PomodoroService {
     }
 
     async pausePomodoro() {
-        if (!this.state.isRunning || !this.timerInterval) {
+        if (!this.state.isRunning) {
             return;
         }
 
@@ -367,42 +431,18 @@ export class PomodoroService {
     }
 
     private startTimer() {
-        this.stopTimer(); // Clear any existing timer
-        
-        // Save state immediately when timer starts
-        this.saveState().catch(error => {
-            console.error('Failed to save state when starting timer:', error);
-        });
-        
-        this.timerInterval = setInterval(async () => {
-            if (this.state.timeRemaining > 0) {
-                this.state.timeRemaining--;
-                
-                // Emit tick event for UI updates
-                this.plugin.emitter.trigger(EVENT_POMODORO_TICK, { 
-                    timeRemaining: this.state.timeRemaining,
-                    session: this.state.currentSession 
-                });
-                
-                // Save state periodically (every 10 seconds) to persist progress
-                if (this.state.timeRemaining % 10 === 0) {
-                    this.saveState().catch(error => {
-                        console.error('Failed to save periodic state:', error);
-                    });
-                }
-            }
+        if (!this.timerWorker) return;
 
-            if (this.state.timeRemaining <= 0) {
-                await this.completePomodoro();
-            }
-        }, 1000) as unknown as number; // Update every second
+        this.timerWorker.postMessage({
+            command: 'start',
+            duration: this.state.timeRemaining
+        });
     }
 
     private stopTimer() {
-        if (this.timerInterval) {
-            clearInterval(this.timerInterval);
-            this.timerInterval = null;
-        }
+        if (!this.timerWorker) return;
+        
+        this.timerWorker.postMessage({ command: 'stop' });
     }
 
     private resumeTimer() {
@@ -525,7 +565,7 @@ export class PomodoroService {
             const message = session.type === 'work' 
                 ? `Pomodoro completed! Time for a ${shouldTakeLongBreak ? 'long' : 'short'} break.`
                 : 'Break completed! Ready for the next pomodoro?';
-            new Notice(message);
+            new Notification(message);
         }
 
         // Play sound if enabled
@@ -625,16 +665,21 @@ export class PomodoroService {
         return { ...this.state };
     }
 
+
     adjustSessionTime(adjustmentSeconds: number): void {
         if (this.state.currentSession) {
-                
+            debugger;
+
+            // Stop timer.
+            this.stopTimer();
+
             // Apply the adjustment directly to timeRemaining
             this.state.timeRemaining = Math.max(1, this.state.timeRemaining + adjustmentSeconds);
-            
+
             // Calculate the new total duration based on how much time has actually elapsed
             const activePeriods = this.state.currentSession.activePeriods || [];
             let totalActiveSeconds = 0;
-            
+
             for (const period of activePeriods) {
                 if (period.endTime) {
                     // Completed period
@@ -646,29 +691,32 @@ export class PomodoroService {
                     const start = new Date(period.startTime).getTime();
                     const now = Date.now();
                     totalActiveSeconds += Math.floor((now - start) / 1000);
+
+                    console.log("activeSeconds:", totalActiveSeconds);
                 }
             }
-            
+
             // New planned duration = elapsed time + remaining time
             const newTotalSeconds = totalActiveSeconds + this.state.timeRemaining;
-            this.state.currentSession.plannedDuration = Math.ceil(newTotalSeconds / 60);
+            // Convert to minutes.
+            this.state.currentSession.plannedDuration = newTotalSeconds / 60;
             
+            console.log("duracion:", this.state.currentSession.plannedDuration);
+
             this.saveState();
-            
-            // Emit tick event to update UI
-            this.plugin.emitter.trigger(EVENT_POMODORO_TICK, {
-                timeRemaining: this.state.timeRemaining,
-                session: this.state.currentSession
-            });
+            this.startTimer();
         }
     }
 
     adjustPreparedTimer(newTimeInSeconds: number): void {
+        // Esta función solo debe funcionar si no hay una sesión activa.
         if (!this.state.currentSession) {
+            this.stopTimer();
+            
             this.state.timeRemaining = newTimeInSeconds;
             this.saveState();
             
-            // Emit tick event to update UI
+            // Emitir evento para actualizar la UI
             this.plugin.emitter.trigger(EVENT_POMODORO_TICK, {
                 timeRemaining: this.state.timeRemaining,
                 session: this.state.currentSession
@@ -848,33 +896,21 @@ export class PomodoroService {
 
     cleanup() {
         this.stopTimer();
-        
-        // Clean up all timeouts
+        if (this.timerWorker) {
+            this.timerWorker.terminate();
+            this.timerWorker = null;
+        }
         for (const timeout of this.cleanupTimeouts) {
             clearTimeout(timeout);
         }
         this.cleanupTimeouts.clear();
-        
-        // Clean up all active audio contexts
         for (const audioContext of this.activeAudioContexts) {
-            try {
-                if (audioContext.state !== 'closed') {
-                    audioContext.close().catch(() => {});
-                }
-            } catch (error) {
-                // Ignore cleanup errors
+            if (audioContext.state !== 'closed') {
+                audioContext.close().catch(() => {});
             }
         }
         this.activeAudioContexts.clear();
-        
-        // Visibility change handler will be cleaned up automatically by Obsidian
-        // when the plugin is unloaded, since we used registerDomEvent
-        this.visibilityChangeHandler = null;
-        
-        // Save final state before cleanup
-        this.saveState().catch(error => {
-            console.error('Failed to save final state:', error);
-        });
+        this.saveState();
     }
 
     /**
