@@ -37,6 +37,15 @@ export class TaskSelectorModal extends FuzzySuggestModal<TaskInfo> {
         return this.tasks
             .filter(task => !task.archived)
             .sort((a, b) => {
+                const statusOrder: Record<string, number> = { "open": 1, "in-progress": 0, "done": 2, "noone": 3 };
+                const aStatus = statusOrder[a.status] ?? 1;
+                const bStatus = statusOrder[b.status] ?? 1;
+                const statusCompare = aStatus - bStatus;
+                // If statuses are different, sort by status
+                if (statusCompare !== 0) {
+                    return statusCompare;
+                }
+                
                 // Sort by due date first (tasks with due dates come first)
                 if (a.due && !b.due) return -1;
                 if (!a.due && b.due) return 1;
@@ -51,6 +60,28 @@ export class TaskSelectorModal extends FuzzySuggestModal<TaskInfo> {
                 const bPriority = priorityOrder[b.priority] ?? 1;
                 if (aPriority !== bPriority) return aPriority - bPriority;
                 
+                // The by projects
+                const aHasProjects = a.projects && a.projects.length > 0;
+                const bHasProjects = b.projects && b.projects.length > 0;
+
+                if (aHasProjects !== bHasProjects) {
+                    return aHasProjects ? 1 : -1;
+                }
+                
+                if (aHasProjects && bHasProjects) {
+                    const sortedA = [...(a.projects || [])].sort();
+                    const sortedB = [...(b.projects || [])].sort();
+                    const len = Math.min(sortedA.length, sortedB.length);
+
+                    for (let i = 0; i < len; i++) {
+                        if (sortedA[i] < sortedB[i]) return -1;
+                        if (sortedA[i] > sortedB[i]) return 1;
+                    }
+                    
+                    if (sortedA.length < sortedB.length) return -1;
+                    if (sortedA.length > sortedB.length) return 1;
+                }
+
                 // Finally by title
                 return a.title.localeCompare(b.title);
             });

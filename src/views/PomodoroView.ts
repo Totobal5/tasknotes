@@ -348,7 +348,9 @@ export class PomodoroView extends ItemView {
     
     private async openTaskSelector() {
         try {
+            // Fetch all tasks from the cache
             const allTasks = await this.plugin.cacheManager.getAllTasks();
+            // Filter out archived tasks
             const unarchivedTasks = allTasks.filter(task => !task.archived);
 
             if (unarchivedTasks.length === 0) {
@@ -356,7 +358,7 @@ export class PomodoroView extends ItemView {
                 return;
             }
 
-            // Open task selector modal
+            // Pass the filtered list to the modal (ordering will be handled in the modal)
             const modal = new TaskSelectorModal(this.app, this.plugin, unarchivedTasks, (selectedTask) => {
                 this.selectTask(selectedTask);
             });
