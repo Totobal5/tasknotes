@@ -37,7 +37,17 @@ export class TaskSelectorModal extends FuzzySuggestModal<TaskInfo> {
         return this.tasks
             .filter(task => !task.archived)
             .sort((a, b) => {
-                // Sort by due date first (tasks with due dates come first)
+                // Status come first
+                const statusOrder: Record<string, number> = { "open": 1, "in-progress": 0, "done": 3, "noone": 2 };
+                const aStatus = statusOrder[a.status] ?? 1;
+                const bStatus = statusOrder[b.status] ?? 1;
+                const statusCompare = aStatus - bStatus;
+                // If statuses are different, sort by status
+                if (statusCompare !== 0) {
+                    return statusCompare;
+                }
+                
+                // Sort by due date (tasks with due dates come first)
                 if (a.due && !b.due) return -1;
                 if (!a.due && b.due) return 1;
                 if (a.due && b.due) {
