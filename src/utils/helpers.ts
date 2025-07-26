@@ -330,12 +330,8 @@ export function isDueByRRule(task: TaskInfo, date: Date): boolean {
 				return false;
 			}
 			
-			// Parse the rrule string and create RRule object
-			// The rrule string should contain all recurrence information including any UNTIL dates
-			const rruleOptions = RRule.parseString(task.recurrence);
-			rruleOptions.dtstart = dtstart;
-			
-			const rrule = new RRule(rruleOptions);
+			// Usar RRule memoizado para mejor rendimiento
+			const rrule = getMemoizedRRule(task.recurrence, dtstart);
 			
 			// Check if the target date is an occurrence
 			// Use UTC date to match the dtstart timezone
@@ -492,6 +488,75 @@ export function shouldUseRecurringTaskUI(task: TaskInfo): boolean {
 	return !!task.recurrence;
 }
 
+// Memoización de objetos RRule para mejorar rendimiento
+const rruleCache: Map<string, { rrule: any; dtstart: Date; lastUsed: number }> = new Map();
+const RRULE_CACHE_TTL = 5 * 60 * 1000; // 5 minutos TTL
+const MAX_RRULE_CACHE_SIZE = 100; // Máximo 100 RRules en cache
+
+/**
+ * Limpia el cache de RRule de entradas antiguas
+ */
+function cleanupRRuleCache(): void {
+    const now = Date.now();
+    const entriesToDelete: string[] = [];
+    
+    for (const [key, entry] of rruleCache.entries()) {
+        if (now - entry.lastUsed > RRULE_CACHE_TTL) {
+            entriesToDelete.push(key);
+        }
+    }
+    
+    entriesToDelete.forEach(key => rruleCache.delete(key));
+    
+    // Si el cache sigue siendo muy grande, eliminar las entradas menos usadas
+    if (rruleCache.size > MAX_RRULE_CACHE_SIZE) {
+        const sortedEntries = Array.from(rruleCache.entries())
+            .sort((a, b) => a[1].lastUsed - b[1].lastUsed);
+        
+        const toDelete = sortedEntries.slice(0, sortedEntries.length - MAX_RRULE_CACHE_SIZE);
+        toDelete.forEach(([key]) => rruleCache.delete(key));
+    }
+}
+
+/**
+ * Obtiene o crea un objeto RRule memoizado
+ */
+function getMemoizedRRule(recurrenceString: string, dtstart: Date): any {
+    const cacheKey = `${recurrenceString}|${dtstart.toISOString()}`;
+    const now = Date.now();
+    
+    // Limpieza periódica del cache
+    if (rruleCache.size > 50) {
+        cleanupRRuleCache();
+    }
+    
+    // Verificar si existe en cache y es válido
+    const cached = rruleCache.get(cacheKey);
+    if (cached && (now - cached.lastUsed) < RRULE_CACHE_TTL) {
+        cached.lastUsed = now;
+        return cached.rrule;
+    }
+    
+    // Crear nuevo RRule
+    try {
+        const rruleOptions = RRule.parseString(recurrenceString);
+        rruleOptions.dtstart = dtstart;
+        const rrule = new RRule(rruleOptions);
+        
+        // Guardar en cache
+        rruleCache.set(cacheKey, {
+            rrule,
+            dtstart: new Date(dtstart),
+            lastUsed: now
+        });
+        
+        return rrule;
+    } catch (error) {
+        console.error('Error creating RRule:', error);
+        throw error;
+    }
+}
+
 /**
  * Generates recurring task instances within a date range using rrule
  */
@@ -516,12 +581,8 @@ export function generateRecurringInstances(task: TaskInfo, startDate: Date, endD
 				return [];
 			}
 			
-			// Parse the rrule string and create RRule object
-			// The rrule string should contain all recurrence information including any UNTIL dates
-			const rruleOptions = RRule.parseString(task.recurrence);
-			rruleOptions.dtstart = dtstart;
-			
-			const rrule = new RRule(rruleOptions);
+			// Usar RRule memoizado para mejor rendimiento
+			const rrule = getMemoizedRRule(task.recurrence, dtstart);
 			
 			// Generate occurrences within the date range
 			return rrule.between(startDate, endDate, true);

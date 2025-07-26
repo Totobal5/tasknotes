@@ -95,10 +95,22 @@ export class AdvancedCalendarView extends ItemView {
     // Mobile collapsible header state
     private headerCollapsed = true;
 
-    private recurringInstanceCache: {
-        [taskId: string]: { range: string, instances: CalendarEvent[] }
+    // Cache unificado para todas las vistas y tipos de eventos
+    private unifiedEventCache: {
+        [cacheKey: string]: {
+            events: CalendarEvent[];
+            lastUpdated: number;
+            viewType: string;
+            dateRange: { start: string; end: string };
+        }
     } = {};
 
+    // Persistent cache for recurring task instances - should survive view changes
+    private recurringInstanceCache: {
+        [taskId: string]: { range: string, instances: CalendarEvent[], lastUpdated: number, loggedHit?: boolean }
+    } = {};
+
+    // Temporary cache for filtered tasks - can be cleared on filter changes
     private taskCache: {
         [key: string]: TaskInfo[]
     } = {};
@@ -119,13 +131,6 @@ export class AdvancedCalendarView extends ItemView {
 
     // Performance optimization properties
     private refreshTimeout: number | null = null;
-
-    // Year view preloading cache
-    private yearViewCache: {
-        year: number;
-        events: CalendarEvent[];
-        lastUpdated: number;
-    } | null = null;
 
     constructor(leaf: WorkspaceLeaf, plugin: TaskNotesPlugin) {
         super(leaf);
@@ -193,6 +198,9 @@ export class AdvancedCalendarView extends ItemView {
         contentEl.empty();
         contentEl.addClass('tasknotes-plugin');
         contentEl.addClass('advanced-calendar-view');
+
+        // Limpiar cachés antiguos de recurrencias al abrir la vista
+        this.cleanupOldRecurringCache();
 
         // Create the calendar container
         await this.renderView();
@@ -477,6 +485,11 @@ export class AdvancedCalendarView extends ItemView {
         
         try {
             await this.plugin.icsSubscriptionService.refreshAllSubscriptions();
+            
+            // Al hacer refresh manual, también limpiar el caché de recurrencias
+            // para asegurar que se recargan con datos frescos
+            this.clearRecurringCache();
+            
             new Notice('All calendar subscriptions refreshed successfully');
             // Force calendar to re-render with updated ICS events
             this.refreshEvents();
@@ -601,10 +614,7 @@ export class AdvancedCalendarView extends ItemView {
             eventMaxStack: 3, // Limitar stack de eventos
             dayMaxEvents: 5, // Limitar eventos por día
             moreLinkClick: 'popover', // Mostrar más eventos en popover
-            progressiveEventRendering: true,
-            
-            // Optimizaciones específicas para diferentes vistas
-            viewDidMount: this.handleViewDidMount.bind(this)
+            progressiveEventRendering: true
         });
 
         // Renderiza y precarga en Year, luego cambia a Month y muestra el calendario
@@ -643,9 +653,42 @@ export class AdvancedCalendarView extends ItemView {
     }
 
     private clearCaches(): void {
+        // Solo limpiar cache de tareas filtradas, NO el de recurrencias
+        // El cache de recurrencias debe persistir entre cambios de vista
         this.taskCache = {};
-        this.recurringInstanceCache = {};
         this.lastViewType = null;
+        
+        console.log('[Cache] Cleared task cache but preserved recurring instance cache');
+    }
+
+    /**
+     * Limpia el caché de recurrencias - solo usar cuando sea absolutamente necesario
+     * (ej: cuando cambian las tareas recurrentes o se fuerza un refresh completo)
+     */
+    private clearRecurringCache(): void {
+        this.recurringInstanceCache = {};
+        console.log('[Cache] Cleared recurring instance cache');
+    }
+
+    /**
+     * Limpia cachés antiguos de recurrencias (más de 24 horas)
+     */
+    private cleanupOldRecurringCache(): void {
+        const now = Date.now();
+        const maxAge = 24 * 60 * 60 * 1000; // 24 horas
+        
+        let cleanedCount = 0;
+        Object.keys(this.recurringInstanceCache).forEach(cacheKey => {
+            const cacheEntry = this.recurringInstanceCache[cacheKey];
+            if (cacheEntry && (now - cacheEntry.lastUpdated) > maxAge) {
+                delete this.recurringInstanceCache[cacheKey];
+                cleanedCount++;
+            }
+        });
+        
+        if (cleanedCount > 0) {
+            console.log(`[Cache] Cleaned up ${cleanedCount} old recurring cache entries`);
+        }
     }
 
     /**
@@ -769,20 +812,19 @@ export class AdvancedCalendarView extends ItemView {
         const events: CalendarEvent[] = [];
         
         try {
-            // OPTIMIZACIÓN CRÍTICA: Detectar vista año para aplicar filtros agresivos
-            const currentView = this.calendar?.view.type;
-            const isYearView = currentView === 'multiMonthYear';
-            
-            if (isYearView) {
-                console.log(`[Performance] Year view detected - applying aggressive optimizations`);
-                // Para vista año, limitar drásticamente el número de eventos
-                return await this.getOptimizedYearViewEvents();
-            }
-
             console.time('getCalendarEvents:getTasks');
             const calendarView = this.calendar?.view;
             const viewType = calendarView?.type || 'dayGridMonth';
             const cacheKey = `${viewType}_${this.currentQuery.id}`;
+            
+            // Verificar cache unificado
+            const now = Date.now();
+            const cachedData = this.unifiedEventCache[cacheKey];
+            if (cachedData && (now - cachedData.lastUpdated) < 120000) { // 2 minutos de validez
+                console.log(`[Unified Cache] Using cached events for ${viewType}: ${cachedData.events.length} events`);
+                this.endPerformanceMonitoring('getCalendarEvents-cached');
+                return [...cachedData.events]; // Retornar copia para evitar mutaciones
+            }
             
             let allTasks: TaskInfo[];
             
@@ -818,14 +860,14 @@ export class AdvancedCalendarView extends ItemView {
                 utcEnd: rawVisibleEnd
             };
 
+            console.timeEnd('getCalendarEvents:dateNormalization');
+            
             // Procesar tareas recurrentes de manera asíncrona para evitar congelamientos
             console.time('getCalendarEvents:recurringTasks');
             const recurringTasks = allTasks.filter(task => task.recurrence && task.scheduled && this.showRecurring);
             const recurringEvents = await this.processRecurringTasksAsync(recurringTasks, visibleStart, visibleEnd);
             events.push(...recurringEvents);
             console.timeEnd('getCalendarEvents:recurringTasks');
-
-            console.timeEnd('getCalendarEvents:dateNormalization');
 
             // Procesar tareas no recurrentes de manera asíncrona
             console.time('getCalendarEvents:normalTasks');
@@ -855,6 +897,20 @@ export class AdvancedCalendarView extends ItemView {
             // Actualizar contador de eventos procesados
             this.performanceMetrics.eventsProcessed = events.length;
             
+            // Guardar en cache unificado
+            const cacheStartDate = calendarView?.activeStart || new Date();
+            const cacheEndDate = calendarView?.activeEnd || new Date();
+            this.unifiedEventCache[cacheKey] = {
+                events: [...events], // Guardar copia
+                lastUpdated: now,
+                viewType: viewType,
+                dateRange: {
+                    start: cacheStartDate.toISOString(),
+                    end: cacheEndDate.toISOString()
+                }
+            };
+            console.log(`[Unified Cache] Cached ${events.length} events for ${viewType}`);
+            
         } catch (error) {
             console.error('Error getting calendar events:', error);
         }
@@ -864,14 +920,51 @@ export class AdvancedCalendarView extends ItemView {
     }
 
     /**
-     * Procesa tareas recurrentes de manera asíncrona para evitar congelamientos
+     * Procesa tareas recurrentes de manera optimizada con cache inteligente
      */
     private async processRecurringTasksAsync(recurringTasks: TaskInfo[], visibleStart: Date, visibleEnd: Date): Promise<CalendarEvent[]> {
+        if (recurringTasks.length === 0) {
+            return [];
+        }
+
         const events: CalendarEvent[] = [];
-        const batchSize = 5; // Procesar 5 tareas por lote para evitar congelamientos
+        const rangeKey = `${visibleStart.toISOString()}_${visibleEnd.toISOString()}`;
         
-        for (let i = 0; i < recurringTasks.length; i += batchSize) {
-            const batch = recurringTasks.slice(i, i + batchSize);
+        // Categorizar tareas por estado de cache en una sola pasada
+        const cachedTasks: TaskInfo[] = [];
+        const uncachedTasks: TaskInfo[] = [];
+        
+        for (const task of recurringTasks) {
+            const cacheKey = task.path;
+            if (this.recurringInstanceCache[cacheKey] && 
+                this.recurringInstanceCache[cacheKey].range === rangeKey) {
+                cachedTasks.push(task);
+            } else {
+                uncachedTasks.push(task);
+            }
+        }
+        
+        console.log(`[Recurring Cache] ${cachedTasks.length} hits, ${uncachedTasks.length} misses for ${recurringTasks.length} tasks`);
+        
+        // Procesar tareas cacheadas síncronamente usando cache directo
+        for (const task of cachedTasks) {
+            const cacheKey = task.path;
+            const cachedEvents = this.recurringInstanceCache[cacheKey].instances;
+            events.push(...cachedEvents);
+        }
+        
+        // Si no hay tareas sin cache, retornar inmediatamente
+        if (uncachedTasks.length === 0) {
+            console.log(`[Recurring Cache] All cache hits - returning ${events.length} cached events`);
+            return events;
+        }
+        
+        // Procesar tareas no cacheadas de manera asíncrona
+        console.log(`[Recurring Cache] Processing ${uncachedTasks.length} uncached tasks asynchronously`);
+        const batchSize = Math.min(5, Math.max(1, Math.ceil(uncachedTasks.length / 4))); // Batch size dinámico
+        
+        for (let i = 0; i < uncachedTasks.length; i += batchSize) {
+            const batch = uncachedTasks.slice(i, i + batchSize);
             
             // Procesar el lote actual
             for (const task of batch) {
@@ -879,8 +972,8 @@ export class AdvancedCalendarView extends ItemView {
                 events.push(...recurringEvents);
             }
             
-            // Dar oportunidad al hilo principal de procesar otros eventos
-            if (i + batchSize < recurringTasks.length) {
+            // Solo yield si hay más lotes por procesar
+            if ((i + batchSize) < uncachedTasks.length) {
                 await new Promise(resolve => requestAnimationFrame(resolve));
             }
         }
@@ -967,9 +1060,15 @@ export class AdvancedCalendarView extends ItemView {
             this.recurringInstanceCache[cacheKey] &&
             this.recurringInstanceCache[cacheKey].range === rangeKey
         ) {
+            // Solo log en debug mode o para primera cache hit de la sesión
+            if (!this.recurringInstanceCache[cacheKey].loggedHit) {
+                console.log(`[Cache Hit] Using cached recurring instances for task: ${task.path}`);
+                this.recurringInstanceCache[cacheKey].loggedHit = true;
+            }
             return this.recurringInstanceCache[cacheKey].instances;
         }
 
+        console.log(`[Cache Miss] Generating new recurring instances for task: ${task.path}`);
         const instances: CalendarEvent[] = [];
         const hasOriginalTime = hasTimeComponent(task.scheduled ?? "");
         const templateTime = this.getRecurringTime(task);
@@ -987,12 +1086,15 @@ export class AdvancedCalendarView extends ItemView {
             }
         }
 
-        // Guardar en cache
+        // Guardar en cache con timestamp
         this.recurringInstanceCache[cacheKey] = {
             range: rangeKey,
-            instances
+            instances,
+            lastUpdated: Date.now(),
+            loggedHit: false // Reset log flag
         };
 
+        console.log(`[Cache Store] Cached ${instances.length} recurring instances for task: ${task.path}`);
         return instances;
     }
 
@@ -1266,256 +1368,6 @@ export class AdvancedCalendarView extends ItemView {
     }
 
     /**
-     * Optimización agresiva para vista año - procesa eventos de manera asíncrona
-     */
-    private async getOptimizedYearViewEvents(): Promise<CalendarEvent[]> {
-        console.log(`[Year Performance] Starting optimized year view event collection with async processing`);
-        this.startPerformanceMonitoring();
-        
-        const currentYear = new Date().getFullYear();
-        
-        // Usar cache si está disponible y es reciente (2 minutos)
-        if (this.yearViewCache && 
-            this.yearViewCache.year === currentYear &&
-            (Date.now() - this.yearViewCache.lastUpdated) < 120000) {
-            
-            console.log(`[Year Performance] Using cached year view data with ${this.yearViewCache.events.length} events`);
-            this.endPerformanceMonitoring('getOptimizedYearViewEvents-cached');
-            return [...this.yearViewCache.events]; // Retornar copia para evitar mutaciones
-        }
-        
-        const events: CalendarEvent[] = [];
-        
-        try {
-            // Obtener el año actual para el rango
-            const now = new Date();
-            const yearStart = new Date(now.getFullYear(), 0, 1);
-            const yearEnd = new Date(now.getFullYear(), 11, 31);
-            
-            // Obtener todas las tareas sin filtros restrictivos
-            const groupedTasks = await this.plugin.filterService.getGroupedTasks(this.currentQuery);
-            const allTasks = Array.from(groupedTasks.values()).flat();
-            
-            console.log(`[Year Performance] Processing ${allTasks.length} total tasks for year view`);
-            
-            // Usar procesamiento por lotes con RequestIdleCallback si está disponible
-            if ('requestIdleCallback' in window) {
-                await this.processTasksWithIdleCallback(allTasks, events, yearStart, yearEnd);
-            } else {
-                // Fallback con RequestAnimationFrame
-                await this.processTasksWithAnimationFrame(allTasks, events, yearStart, yearEnd);
-            }
-            
-            // Actualizar cache con los nuevos datos
-            this.yearViewCache = {
-                year: currentYear,
-                events: [...events], // Guardar copia
-                lastUpdated: Date.now()
-            };
-            
-        } catch (error) {
-            console.error('[Year Performance] Error in optimized year view:', error);
-        }
-        
-        this.endPerformanceMonitoring('getOptimizedYearViewEvents');
-        console.log(`[Year Performance] Returning ${events.length} events for year view`);
-        
-        return events;
-    }
-
-    /**
-     * Procesa tareas usando RequestIdleCallback para mejor responsividad
-     */
-    private async processTasksWithIdleCallback(allTasks: TaskInfo[], events: CalendarEvent[], yearStart: Date, yearEnd: Date): Promise<void> {
-        return new Promise((resolve) => {
-            let processedCount = 0;
-            const batchSize = 25; // Lotes moderados para idle callback
-
-            const processNextBatch = (deadline: any) => {
-                const startTime = performance.now();
-                
-                while ((deadline.timeRemaining() > 0 || deadline.didTimeout) && 
-                       processedCount < allTasks.length &&
-                       (performance.now() - startTime) < 10) { // Máximo 10ms por batch
-                    
-                    const endIndex = Math.min(processedCount + batchSize, allTasks.length);
-                    const batch = allTasks.slice(processedCount, endIndex);
-                    
-                    this.processBatchSync(batch, events, yearStart, yearEnd);
-                    processedCount = endIndex;
-                }
-
-                if (processedCount < allTasks.length) {
-                    // Continuar en el siguiente frame idle
-                    (window as any).requestIdleCallback(processNextBatch);
-                } else {
-                    resolve();
-                }
-            };
-
-            (window as any).requestIdleCallback(processNextBatch);
-        });
-    }
-
-    /**
-     * Procesa tareas usando RequestAnimationFrame como fallback
-     */
-    private async processTasksWithAnimationFrame(allTasks: TaskInfo[], events: CalendarEvent[], yearStart: Date, yearEnd: Date): Promise<void> {
-        return new Promise((resolve) => {
-            let processedCount = 0;
-            const batchSize = 50; // Lotes más grandes para animation frame
-
-            const processNextBatch = () => {
-                const startTime = performance.now();
-                
-                while (processedCount < allTasks.length && 
-                       (performance.now() - startTime) < 16) { // Mantener 60fps
-                    
-                    const endIndex = Math.min(processedCount + batchSize, allTasks.length);
-                    const batch = allTasks.slice(processedCount, endIndex);
-                    
-                    this.processBatchSync(batch, events, yearStart, yearEnd);
-                    processedCount = endIndex;
-                }
-
-                if (processedCount < allTasks.length) {
-                    requestAnimationFrame(processNextBatch);
-                } else {
-                    resolve();
-                }
-            };
-
-            requestAnimationFrame(processNextBatch);
-        });
-    }
-
-    /**
-     * Procesa un lote de tareas de manera síncrona
-     */
-    private processBatchSync(tasks: TaskInfo[], events: CalendarEvent[], yearStart: Date, yearEnd: Date): void {
-        for (const task of tasks) {
-            // Procesar tareas programadas (scheduled)
-            if (this.showScheduled && task.scheduled && !task.recurrence) {
-                const scheduledEvent = this.createScheduledEvent(task);
-                if (scheduledEvent) events.push(scheduledEvent);
-            }
-            
-            // Procesar tareas con fecha de vencimiento (due)
-            if (this.showDue && task.due && !task.recurrence) {
-                const dueEvent = this.createDueEvent(task);
-                if (dueEvent) events.push(dueEvent);
-            }
-            
-            // Procesar eventos recurrentes
-            if (this.showRecurring && task.recurrence && task.scheduled) {
-                const instances = this.generateRecurringTaskInstances(task, yearStart, yearEnd);
-                events.push(...instances);
-            }
-            
-            // Procesar time entries
-            if (this.showTimeEntries && task.timeEntries) {
-                const timeEvents = this.createTimeEntryEvents(task);
-                events.push(...timeEvents);
-            }
-        }
-        
-        // Procesar eventos ICS al final del último lote
-        if (tasks === tasks && this.showICSEvents && this.plugin.icsSubscriptionService) {
-            try {
-                const icsEvents = this.plugin.icsSubscriptionService.getAllEvents();
-                const calendarEvents = icsEvents
-                    .map(event => this.createICSEvent(event))
-                    .filter(event => event !== null) as CalendarEvent[];
-                events.push(...calendarEvents);
-            } catch (error) {
-                console.error('[Year Performance] Error with ICS events:', error);
-            }
-        }
-    }
-
-    /**
-     * Procesamiento ligero para conjuntos muy grandes de eventos
-     */
-    private lightweightEventProcessing(events: CalendarEvent[]): void {
-        this.startPerformanceMonitoring();
-        
-        // Solo procesar metadatos, no crear elementos DOM
-        events.forEach(event => {
-            this.performanceMetrics.eventsProcessed++;
-        });
-        
-        this.performanceMetrics.domOperations = 1;
-        this.endPerformanceMonitoring('lightweightEventProcessing');
-    }
-
-    /**
-     * Handle view changes para aplicar configuraciones específicas
-     */
-    private handleViewDidMount(mountInfo: any): void {
-        const viewType = mountInfo.view.type;
-        console.log(`[View Change] Mounted view: ${viewType}`);
-        
-        // Aplicar configuraciones específicas por vista
-        if (viewType === 'multiMonthYear') {
-            // Para vista año, configuraciones moderadas para mejor performance
-            this.calendar?.setOption('dayMaxEvents', 2);
-            this.calendar?.setOption('eventMaxStack', 2);
-            
-            // Aplicar optimizaciones adicionales para vista año
-            console.log(`[View Performance] Applying moderate Year view optimizations`);
-            this.applyYearViewOptimizations();
-        } else {
-            // Para otras vistas, usar límites normales
-            this.calendar?.setOption('dayMaxEvents', 5);
-            this.calendar?.setOption('eventMaxStack', 3);
-            
-            // Aplicar optimizaciones para otras vistas
-            console.log(`[View Performance] Applying standard view optimizations for ${viewType}`);
-            this.applyStandardViewOptimizations();
-            
-            // Precargar vista año en background si no estamos en ella
-            this.preloadYearViewInBackground();
-        }
-        
-        // Aplicar GPU acceleration a nuevos elementos renderizados
-        setTimeout(() => {
-            this.applyGPUToFullCalendarElements();
-        }, 10);
-    }
-
-    /**
-     * Precarga la vista año en background para transiciones más rápidas
-     */
-    private async preloadYearViewInBackground(): Promise<void> {
-        const currentYear = new Date().getFullYear();
-        
-        // Solo precargar si no tenemos cache o es muy antiguo (5 minutos)
-        if (!this.yearViewCache || 
-            this.yearViewCache.year !== currentYear ||
-            (Date.now() - this.yearViewCache.lastUpdated) > 300000) {
-            
-            console.log(`[Background Preload] Starting year view preload for ${currentYear}`);
-            
-            // Usar RequestIdleCallback para no interferir con la UI
-            if ('requestIdleCallback' in window) {
-                (window as any).requestIdleCallback(async () => {
-                    try {
-                        const events = await this.getOptimizedYearViewEvents();
-                        this.yearViewCache = {
-                            year: currentYear,
-                            events: events,
-                            lastUpdated: Date.now()
-                        };
-                        console.log(`[Background Preload] Year view preloaded with ${events.length} events`);
-                    } catch (error) {
-                        console.error('[Background Preload] Error preloading year view:', error);
-                    }
-                }, { timeout: 2000 });
-            }
-        }
-    }
-
-    /**
      * Aplica optimizaciones de performance sin interferir con el renderizado de FullCalendar
      */
     private applyPerformanceOptimizations(): void {
@@ -1653,55 +1505,6 @@ export class AdvancedCalendarView extends ItemView {
         });
         
         console.log(`[GPU Acceleration] Applied extreme GPU acceleration to calendar elements`);
-    }
-
-    /**
-     * Optimizaciones específicas para la vista Year
-     */
-    private applyYearViewOptimizations(): void {
-        if (!this.calendar) return;
-        
-        // Configuraciones moderadas para vista año (no ultra agresivas)
-        this.calendar.setOption('dayMaxEvents', 2); // 2 eventos por día
-        this.calendar.setOption('eventMaxStack', 2); // Stack de 2
-        this.calendar.setOption('moreLinkClick', 'popover'); // Resto en popover
-        this.calendar.setOption('progressiveEventRendering', true);
-        this.calendar.setOption('lazyFetching', true);
-        
-        // Aplicar estilos CSS optimizados para vista año con GPU acceleration
-        const calendarEl = this.contentEl.querySelector('#advanced-calendar') as HTMLElement;
-        if (calendarEl) {
-            calendarEl.classList.add('fc-year-view-optimized');
-            calendarEl.classList.add('fc-calendar-loading'); // Estado de loading visual
-            
-            // GPU acceleration agresiva para el calendario
-            this.applyGPUAcceleration(calendarEl);
-            
-            // Remover estado de loading después de un momento
-            setTimeout(() => {
-                calendarEl.classList.remove('fc-calendar-loading');
-            }, 300);
-        }
-        
-        console.log(`[Performance] Moderate Year view optimizations with GPU acceleration applied`);
-    }
-
-    /**
-     * Optimizaciones estándar para vistas Month, Week, Day
-     */
-    private applyStandardViewOptimizations(): void {
-        if (!this.calendar) return;
-        
-        // Configuraciones optimizadas para vistas estándar
-        const calendarEl = this.contentEl.querySelector('#advanced-calendar') as HTMLElement;
-        if (calendarEl) {
-            calendarEl.classList.remove('fc-year-view-optimized');
-            
-            // Aplicar GPU acceleration menos agresiva para vistas estándar
-            this.applyGPUAcceleration(calendarEl);
-        }
-        
-        console.log(`[Performance] Standard view optimizations with GPU acceleration applied`);
     }
 
     createScheduledEvent(task: TaskInfo): CalendarEvent | null {
@@ -2691,8 +2494,8 @@ export class AdvancedCalendarView extends ItemView {
     }
 
     async onClose() {
-        // Clean up year view cache
-        this.yearViewCache = null;
+        // Clean up unified cache
+        this.unifiedEventCache = {};
 
         // Clean up resize handling
         if (this.resizeObserver) {
