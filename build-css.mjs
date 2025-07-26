@@ -24,6 +24,7 @@ const CSS_FILES = [
     'styles/task-list-view.css',     // TaskListView component with proper BEM scoping
     'styles/calendar-view.css',      // CalendarView component with proper BEM scoping
     'styles/advanced-calendar-view.css', // AdvancedCalendarView component with proper BEM scoping
+    'styles/calendar-performance.css', // Calendar DOM performance optimizations
     'styles/kanban-view.css',        // KanbanView component with proper BEM scoping
     'styles/agenda-view.css',        // AgendaView component with proper BEM scoping
     'styles/notes-view.css',         // NotesView component with proper BEM scoping

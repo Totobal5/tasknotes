@@ -1,0 +1,428 @@
+/* Calendar Performance Optimizations */
+
+/* GPU Acceleration para el contenedor principal del calendario */
+#advanced-calendar {
+  transform: translate3d(0, 0, 0);
+  -webkit-transform: translate3d(0, 0, 0);
+  will-change: transform, opacity;
+  -webkit-backface-visibility: hidden;
+  backface-visibility: hidden;
+  perspective: 1000px;
+  -webkit-perspective: 1000px;
+  contain: layout style paint;
+}
+
+/* GPU Acceleration para todos los elementos de FullCalendar */
+.fc-view-harness,
+.fc-daygrid,
+.fc-timegrid,
+.fc-multimonth {
+  transform: translate3d(0, 0, 0);
+  -webkit-transform: translate3d(0, 0, 0);
+  will-change: transform, opacity;
+  -webkit-backface-visibility: hidden;
+  backface-visibility: hidden;
+  contain: layout style paint;
+}
+
+/* GPU Acceleration para filas y celdas */
+.fc-daygrid-week,
+.fc-daygrid-day,
+.fc-timegrid-col,
+.fc-multimonth-month {
+  transform: translate3d(0, 0, 0);
+  -webkit-transform: translate3d(0, 0, 0);
+  will-change: transform;
+  -webkit-backface-visibility: hidden;
+  backface-visibility: hidden;
+  contain: layout style paint;
+}
+
+/* Forzar compositing layers para mejor performance */
+.fc-event-optimized,
+.fc-ics-event,
+.fc-timeblock-event,
+.fc-task-event {
+  will-change: transform, opacity;
+  transform: translate3d(0, 0, 0);
+  -webkit-transform: translate3d(0, 0, 0);
+  -webkit-backface-visibility: hidden;
+  backface-visibility: hidden;
+  contain: layout style paint;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeSpeed;
+}
+
+/* GPU Acceleration super agresiva para eventos */
+.fc-event,
+.fc-event-main,
+.fc-event-title {
+  transform: translate3d(0, 0, 0);
+  -webkit-transform: translate3d(0, 0, 0);
+  will-change: transform, opacity;
+  -webkit-backface-visibility: hidden;
+  backface-visibility: hidden;
+  contain: layout style paint;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeSpeed;
+}
+
+/* GPU Acceleration para popover y more-links */
+.fc-popover,
+.fc-more-link,
+.fc-more-popover {
+  transform: translate3d(0, 0, 0);
+  -webkit-transform: translate3d(0, 0, 0);
+  will-change: transform, opacity;
+  -webkit-backface-visibility: hidden;
+  backface-visibility: hidden;
+  contain: layout style paint;
+}
+
+/* Optimizaciones para eventos recurrentes */
+.fc-recurring-event {
+  will-change: opacity, transform;
+  transform: translate3d(0, 0, 0);
+  -webkit-transform: translate3d(0, 0, 0);
+  -webkit-backface-visibility: hidden;
+  backface-visibility: hidden;
+}
+
+/* Optimizaciones para elementos completados */
+.fc-completed-event {
+  will-change: opacity;
+  transition: opacity 0.2s ease;
+  transform: translate3d(0, 0, 0);
+  -webkit-transform: translate3d(0, 0, 0);
+  -webkit-backface-visibility: hidden;
+  backface-visibility: hidden;
+}
+
+/* Optimizaciones para hover states con GPU */
+.fc-event:hover {
+  transform: translate3d(0, 0, 0) scale(1.02);
+  -webkit-transform: translate3d(0, 0, 0) scale(1.02);
+  transition: transform 0.1s ease;
+  will-change: transform;
+}
+
+/* Evitar reflows en animaciones */
+.fc-event {
+  contain: layout style paint;
+  transform: translate3d(0, 0, 0);
+  -webkit-transform: translate3d(0, 0, 0);
+  -webkit-backface-visibility: hidden;
+  backface-visibility: hidden;
+}
+
+/* Optimizar el rendering de texto */
+.fc-event-title {
+  contain: layout style;
+  text-rendering: optimizeSpeed;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  transform: translate3d(0, 0, 0);
+  -webkit-transform: translate3d(0, 0, 0);
+}
+
+/* GPU acceleration para drag and drop */
+.fc-event.fc-event-dragging,
+.fc-event.fc-event-resizing {
+  will-change: transform;
+  transform: translate3d(0, 0, 0);
+  -webkit-transform: translate3d(0, 0, 0);
+  -webkit-backface-visibility: hidden;
+  backface-visibility: hidden;
+  contain: layout style paint;
+}
+
+/* Optimizar popover de "more events" */
+.fc-popover {
+  will-change: transform, opacity;
+  transform: translate3d(0, 0, 0);
+  -webkit-transform: translate3d(0, 0, 0);
+  -webkit-backface-visibility: hidden;
+  backface-visibility: hidden;
+  contain: layout style paint;
+}
+
+/* Optimizar performance de multi-month view */
+.fc-multimonth {
+  contain: layout style;
+  transform: translate3d(0, 0, 0);
+  -webkit-transform: translate3d(0, 0, 0);
+  -webkit-backface-visibility: hidden;
+  backface-visibility: hidden;
+}
+
+.fc-multimonth-title {
+  contain: layout style paint;
+  transform: translate3d(0, 0, 0);
+  -webkit-transform: translate3d(0, 0, 0);
+  -webkit-backface-visibility: hidden;
+  backface-visibility: hidden;
+  text-rendering: optimizeSpeed;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Optimizaciones específicas para vista año con GPU extrema */
+.fc-year-view-optimized {
+  transform: translate3d(0, 0, 0);
+  -webkit-transform: translate3d(0, 0, 0);
+  will-change: transform, opacity;
+  -webkit-backface-visibility: hidden;
+  backface-visibility: hidden;
+  perspective: 1000px;
+  -webkit-perspective: 1000px;
+  contain: strict;
+}
+
+.fc-year-view-optimized .fc-multimonth {
+  contain: strict;
+  content-visibility: auto;
+  contain-intrinsic-size: 800px 600px;
+  transform: translate3d(0, 0, 0);
+  -webkit-transform: translate3d(0, 0, 0);
+  will-change: transform;
+  -webkit-backface-visibility: hidden;
+  backface-visibility: hidden;
+}
+
+.fc-year-view-optimized .fc-multimonth-month {
+  contain: layout style paint;
+  content-visibility: auto;
+  contain-intrinsic-size: 200px 150px;
+  transform: translate3d(0, 0, 0);
+  -webkit-transform: translate3d(0, 0, 0);
+  will-change: transform;
+  -webkit-backface-visibility: hidden;
+  backface-visibility: hidden;
+}
+
+.fc-year-view-optimized .fc-event {
+  transform: translate3d(0, 0, 0);
+  -webkit-transform: translate3d(0, 0, 0);
+  will-change: transform;
+  -webkit-backface-visibility: hidden;
+  backface-visibility: hidden;
+  contain: strict;
+  content-visibility: auto;
+}
+
+/* Optimizaciones ultra-agresivas para RequestIdleCallback */
+.fc-event[data-gpu-optimized="true"] {
+  transform: translate3d(0, 0, 0);
+  -webkit-transform: translate3d(0, 0, 0);
+  will-change: transform, opacity;
+  -webkit-backface-visibility: hidden;
+  backface-visibility: hidden;
+  contain: layout style paint;
+  content-visibility: auto;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeSpeed;
+  pointer-events: auto;
+}
+
+/* Optimizaciones para hover con GPU */
+.fc-event[data-gpu-optimized="true"]:hover {
+  transform: translate3d(0, 0, 0) scale(1.02);
+  -webkit-transform: translate3d(0, 0, 0) scale(1.02);
+  transition: transform 0.1s ease-out;
+  will-change: transform;
+}
+
+/* Optimizaciones específicas para eventos procesados con IdleCallback */
+.fc-event[data-render-hint="fast"] {
+  animation: none;
+  transition: opacity 0.2s ease-out;
+  will-change: opacity;
+}
+
+/* Optimizaciones para vista año completa */
+.fc-year-view-optimized .fc-daygrid-event {
+  contain: layout style paint;
+  content-visibility: auto;
+  transform: translate3d(0, 0, 0);
+  -webkit-transform: translate3d(0, 0, 0);
+}
+
+/* Forzar aceleración GPU en elementos críticos */
+.fc-year-view-optimized .fc-scrollgrid,
+.fc-year-view-optimized .fc-scrollgrid-section,
+.fc-year-view-optimized .fc-col-header {
+  transform: translate3d(0, 0, 0);
+  -webkit-transform: translate3d(0, 0, 0);
+  will-change: transform;
+  -webkit-backface-visibility: hidden;
+  backface-visibility: hidden;
+}
+
+/* Optimizar grids de tiempo */
+.fc-timegrid-body,
+.fc-daygrid-body {
+  contain: layout style;
+}
+
+/* Evitar repaints innecesarios */
+.fc-scrollgrid-liquid {
+  contain: layout;
+}
+
+/* Optimizar elementos con muchos hijos */
+.fc-timegrid-slots,
+.fc-daygrid-week {
+  contain: layout style;
+}
+
+/* Optimizaciones específicas para vista Year que causan congelamiento */
+.fc-multimonth-year {
+  /* Usar content-visibility para mejor performance en vistas complejas */
+  content-visibility: auto;
+  contain-intrinsic-size: 800px 600px;
+}
+
+/* Optimizar celdas individuales en vista año */
+.fc-multimonth-month {
+  contain: layout style paint;
+  content-visibility: auto;
+  contain-intrinsic-size: 200px 150px;
+}
+
+/* Reducir complejidad de rendering en vista año */
+.fc-multimonth-daygrid-table {
+  contain: layout style;
+}
+
+/* Optimizar performance de eventos en vista año */
+.fc-multimonth .fc-event {
+  contain: layout style paint;
+  will-change: auto; /* Solo cuando sea necesario */
+}
+
+/* Evitar reflows durante cambios de vista */
+.fc-view-harness {
+  contain: layout;
+  transform: translateZ(0);
+}
+
+/* Optimizaciones dinámicas para vista Year cuando se detecta como optimizada */
+.fc-year-view-optimized .fc-multimonth {
+  contain: strict;
+  content-visibility: auto;
+  contain-intrinsic-size: 800px 600px;
+}
+
+.fc-year-view-optimized .fc-multimonth-month {
+  contain: layout style paint;
+  will-change: auto;
+}
+
+.fc-year-view-optimized .fc-event {
+  contain: layout style;
+  will-change: auto;
+  transform: translateZ(0);
+  transition: opacity 0.15s ease-out, transform 0.15s ease-out;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Optimizaciones adicionales para transiciones suaves */
+.fc-year-view-optimized .fc-daygrid-week,
+.fc-year-view-optimized .fc-month-view {
+  transform: translateZ(0);
+  -webkit-transform: translateZ(0);
+  -webkit-backface-visibility: hidden;
+  backface-visibility: hidden;
+}
+
+/* Estados de transición para mejor UX */
+.fc-calendar-transition {
+  transition: opacity 0.2s ease-in-out;
+}
+
+.fc-calendar-loading {
+  opacity: 0.7;
+  pointer-events: none;
+  position: relative;
+}
+
+.fc-calendar-loading::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 20px;
+  height: 20px;
+  margin: -10px 0 0 -10px;
+  border: 2px solid var(--text-muted);
+  border-radius: 50%;
+  border-top-color: var(--color-accent);
+  animation: spin 1s ease-in-out infinite;
+  z-index: 1000;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* Mejorar rendering de texto en eventos durante transiciones */
+.fc-year-view-optimized .fc-event-main {
+  contain: layout;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Optimizaciones agresivas para vista año */
+.fc-year-view-optimized .fc-multimonth {
+  contain: strict;
+  content-visibility: auto;
+  contain-intrinsic-size: 800px 600px;
+  will-change: auto;
+}
+
+.fc-year-view-optimized .fc-multimonth-month {
+  contain: layout style paint;
+  content-visibility: auto;
+  contain-intrinsic-size: 200px 150px;
+  will-change: auto;
+}
+
+/* Reducir complejidad de eventos en vista año */
+.fc-year-view-optimized .fc-event {
+  font-size: 11px;
+  padding: 1px 2px;
+  line-height: 1.2;
+  contain: layout style;
+  will-change: auto;
+  transform: translateZ(0);
+  transition: opacity 0.15s ease-out, transform 0.15s ease-out;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Reducir el tamaño de elementos more-link en vista año */
+.fc-year-view-optimized .fc-more-link {
+  font-size: 10px;
+  padding: 0 2px;
+  line-height: 1.1;
+}
+
+/* Optimizar celdas de día en vista año */
+.fc-year-view-optimized .fc-daygrid-day {
+  contain: style paint;
+  min-height: 20px;
+}
+
+/* Ocultar elementos no esenciales en vista año */
+.fc-year-view-optimized .fc-event-time {
+  display: none;
+}
+
+.fc-year-view-optimized .fc-event-title {
+  font-weight: normal;
+  font-size: 10px;
+}

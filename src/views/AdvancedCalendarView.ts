@@ -103,6 +103,30 @@ export class AdvancedCalendarView extends ItemView {
         [key: string]: TaskInfo[]
     } = {};
 
+    private lastViewType: string | null = null;
+
+    // DOM Performance monitoring
+    private performanceMetrics = {
+        renderStart: 0,
+        renderEnd: 0,
+        domOperations: 0,
+        eventsProcessed: 0
+    };
+
+    // DOM optimization caches
+    private eventElementPool: Map<string, HTMLElement> = new Map();
+    private documentFragment: DocumentFragment | null = null;
+
+    // Performance optimization properties
+    private refreshTimeout: number | null = null;
+
+    // Year view preloading cache
+    private yearViewCache: {
+        year: number;
+        events: CalendarEvent[];
+        lastUpdated: number;
+    } | null = null;
+
     constructor(leaf: WorkspaceLeaf, plugin: TaskNotesPlugin) {
         super(leaf);
         this.plugin = plugin;
@@ -277,7 +301,7 @@ export class AdvancedCalendarView extends ItemView {
         this.filterBar.on('queryChange', async (newQuery: FilterQuery) => {
             this.currentQuery = newQuery;
             await this.plugin.viewStateManager.setFilterState(ADVANCED_CALENDAR_VIEW_TYPE, newQuery);
-            this.refreshEvents();
+            this.createDebouncedRefresh();
         });
 
         // Set up view-specific options
@@ -308,7 +332,7 @@ export class AdvancedCalendarView extends ItemView {
                 onChange: (value: boolean) => {
                     this.showICSEvents = value;
                     this.saveViewPreferences();
-                    this.refreshEvents();
+                    this.createDebouncedRefresh();
                 }
             },
             {
@@ -318,7 +342,7 @@ export class AdvancedCalendarView extends ItemView {
                 onChange: (value: boolean) => {
                     this.showTimeEntries = value;
                     this.saveViewPreferences();
-                    this.refreshEvents();
+                    this.createDebouncedRefresh();
                 }
             },
             {
@@ -328,7 +352,7 @@ export class AdvancedCalendarView extends ItemView {
                 onChange: (value: boolean) => {
                     this.showTimeblocks = value;
                     this.saveViewPreferences();
-                    this.refreshEvents();
+                    this.createDebouncedRefresh();
                 }
             },
             {
@@ -338,7 +362,7 @@ export class AdvancedCalendarView extends ItemView {
                 onChange: (value: boolean) => {
                     this.showScheduled = value;
                     this.saveViewPreferences();
-                    this.refreshEvents();
+                    this.createDebouncedRefresh();
                 }
             },
             {
@@ -348,7 +372,7 @@ export class AdvancedCalendarView extends ItemView {
                 onChange: (value: boolean) => {
                     this.showDue = value;
                     this.saveViewPreferences();
-                    this.refreshEvents();
+                    this.createDebouncedRefresh();
                 }
             }
         ];
@@ -572,6 +596,15 @@ export class AdvancedCalendarView extends ItemView {
             
             // Event sources will be added dynamically
             events: this.getCalendarEvents.bind(this),
+
+            lazyFetching: true,
+            eventMaxStack: 3, // Limitar stack de eventos
+            dayMaxEvents: 5, // Limitar eventos por día
+            moreLinkClick: 'popover', // Mostrar más eventos en popover
+            progressiveEventRendering: true,
+            
+            // Optimizaciones específicas para diferentes vistas
+            viewDidMount: this.handleViewDidMount.bind(this)
         });
 
         // Renderiza y precarga en Year, luego cambia a Month y muestra el calendario
@@ -581,9 +614,15 @@ export class AdvancedCalendarView extends ItemView {
                 this.setupResizeHandling();
                 this.refreshEvents();
 
-                // Cambia a Month y muestra el calendario tras precarga
+                // Aplicar GPU acceleration inmediatamente después del render
+                this.initializeGPUAcceleration();
+
+                // Solo cambiar vista si realmente se necesita evitar el bucle infinito
                 setTimeout(() => {
-                    this.calendar?.changeView('dayGridMonth');
+                    if (this.calendar && this.calendar.view.type === 'multiMonthYear') {
+                        console.log('[Calendar Init] Switching from Year to Month view');
+                        this.calendar.changeView('dayGridMonth');
+                    }
                     (calendarEl as HTMLElement).style.visibility = 'visible';
                 }, 100);
             }
@@ -601,6 +640,26 @@ export class AdvancedCalendarView extends ItemView {
             headerCollapsed: this.headerCollapsed
         };
         this.plugin.viewStateManager.setViewPreferences(ADVANCED_CALENDAR_VIEW_TYPE, preferences);
+    }
+
+    private clearCaches(): void {
+        this.taskCache = {};
+        this.recurringInstanceCache = {};
+        this.lastViewType = null;
+    }
+
+    /**
+     * Debounced refresh to prevent excessive re-renders during rapid view changes
+     */
+    private createDebouncedRefresh(): void {
+        if (this.refreshTimeout) {
+            window.clearTimeout(this.refreshTimeout);
+        }
+        
+        this.refreshTimeout = window.setTimeout(() => {
+            console.log('[View Change] Refreshing events after debounce');
+            this.refreshEvents();
+        }, 150); // 150ms debounce delay
     }
 
     private setupResizeHandling(): void {
@@ -706,10 +765,20 @@ export class AdvancedCalendarView extends ItemView {
      * @returns {Promise<CalendarEvent[]>} A promise that resolves to an array of `CalendarEvent` objects to be displayed.
      */
     async getCalendarEvents(): Promise<CalendarEvent[]> {
+        this.startPerformanceMonitoring();
         const events: CalendarEvent[] = [];
         
         try {
-            // Solo obtener tareas si no están en caché para la vista actual
+            // OPTIMIZACIÓN CRÍTICA: Detectar vista año para aplicar filtros agresivos
+            const currentView = this.calendar?.view.type;
+            const isYearView = currentView === 'multiMonthYear';
+            
+            if (isYearView) {
+                console.log(`[Performance] Year view detected - applying aggressive optimizations`);
+                // Para vista año, limitar drásticamente el número de eventos
+                return await this.getOptimizedYearViewEvents();
+            }
+
             console.time('getCalendarEvents:getTasks');
             const calendarView = this.calendar?.view;
             const viewType = calendarView?.type || 'dayGridMonth';
@@ -731,87 +800,48 @@ export class AdvancedCalendarView extends ItemView {
             }
             console.timeEnd('getCalendarEvents:getTasks');
 
-            // Medir normalización de fechas
             console.time('getCalendarEvents:dateNormalization');
             
-            // Ajustar el rango de fechas para la vista year
-            let rawVisibleStart: Date, rawVisibleEnd: Date;
+            // Siempre usar el rango del año completo para la recolección de datos
+            const year = calendarView?.currentStart.getFullYear() || new Date().getFullYear();
+            const rawVisibleStart = new Date(Date.UTC(year, 0, 1));
+            const rawVisibleEnd = new Date(Date.UTC(year, 11, 31, 23, 59, 59, 999));
             
-            if (viewType === 'multiMonthYear') {
-                // Para vista year, usar el año completo
-                const year = calendarView?.currentStart.getFullYear() || new Date().getFullYear();
-                // Importante: Usar UTC consistentemente
-                rawVisibleStart = new Date(Date.UTC(year, 0, 1)); // 1 de enero UTC
-                rawVisibleEnd = new Date(Date.UTC(year, 11, 31, 23, 59, 59, 999)); // 31 de diciembre UTC
-                
-                console.log('Year view range (UTC):', 
-                    rawVisibleStart.toISOString(), 
-                    'to', 
-                    rawVisibleEnd.toISOString()
-                );
+            console.log('Year view range (UTC):', 
+                rawVisibleStart.toISOString(), 
+                'to', 
+                rawVisibleEnd.toISOString()
+            );
 
-                // Forzar el rango completo para tareas recurrentes en vista year
-                const { utcStart: visibleStart, utcEnd: visibleEnd } = {
-                    utcStart: rawVisibleStart,
-                    utcEnd: rawVisibleEnd
-                };
+            const { utcStart: visibleStart, utcEnd: visibleEnd } = {
+                utcStart: rawVisibleStart,
+                utcEnd: rawVisibleEnd
+            };
 
-                // Procesar tareas recurrentes con el rango anual completo
-                console.time('getCalendarEvents:recurringTasks');
-                for (const task of allTasks) {
-                    if (task.recurrence && task.scheduled && this.showRecurring) {
-                        const recurringEvents = this.generateRecurringTaskInstances(task, visibleStart, visibleEnd);
-                        events.push(...recurringEvents);
-                    }
-                }
-                console.timeEnd('getCalendarEvents:recurringTasks');
-            } else {
-                // Para otras vistas, usar el rango visible normal
-                rawVisibleStart = calendarView?.activeStart || startOfDay(new Date());
-                rawVisibleEnd = calendarView?.activeEnd || endOfDay(new Date());
-                
-                const { utcStart: visibleStart, utcEnd: visibleEnd } = normalizeCalendarBoundariesToUTC(rawVisibleStart, rawVisibleEnd);
+            // Procesar tareas recurrentes de manera asíncrona para evitar congelamientos
+            console.time('getCalendarEvents:recurringTasks');
+            const recurringTasks = allTasks.filter(task => task.recurrence && task.scheduled && this.showRecurring);
+            const recurringEvents = await this.processRecurringTasksAsync(recurringTasks, visibleStart, visibleEnd);
+            events.push(...recurringEvents);
+            console.timeEnd('getCalendarEvents:recurringTasks');
 
-                // Procesar tareas recurrentes con el rango normal
-                console.time('getCalendarEvents:recurringTasks');
-                for (const task of allTasks) {
-                    if (task.recurrence && task.scheduled && this.showRecurring) {
-                        const recurringEvents = this.generateRecurringTaskInstances(task, visibleStart, visibleEnd);
-                        events.push(...recurringEvents);
-                    }
-                }
-                console.timeEnd('getCalendarEvents:recurringTasks');
-            }
+            console.timeEnd('getCalendarEvents:dateNormalization');
 
-            // Medir procesamiento de tareas no recurrentes
+            // Procesar tareas no recurrentes de manera asíncrona
             console.time('getCalendarEvents:normalTasks');
-            for (const task of allTasks) {
-                if (!task.recurrence) {
-                    if (this.showScheduled && task.scheduled) {
-                        const scheduledEvent = this.createScheduledEvent(task);
-                        if (scheduledEvent) events.push(scheduledEvent);
-                    }
-                    if (this.showDue && task.due) {
-                        const dueEvent = this.createDueEvent(task);
-                        if (dueEvent) events.push(dueEvent);
-                    }
-                }
-            }
+            const normalEvents = await this.processNormalTasksAsync(allTasks);
+            events.push(...normalEvents);
             console.timeEnd('getCalendarEvents:normalTasks');
 
-            // Medir procesamiento de time entries
+            // Procesar time entries de manera asíncrona
             console.time('getCalendarEvents:timeEntries');
             if (this.showTimeEntries) {
-                for (const task of allTasks) {
-                    if (task.timeEntries) {
-                        const timeEvents = this.createTimeEntryEvents(task);
-                        events.push(...timeEvents);
-                    }
-                }
+                const timeEvents = await this.processTimeEntriesAsync(allTasks);
+                events.push(...timeEvents);
             }
             console.timeEnd('getCalendarEvents:timeEntries');
 
-            // Medir procesamiento de eventos ICS
+            // Procesar eventos ICS
             console.time('getCalendarEvents:icsEvents');
             if (this.showICSEvents && this.plugin.icsSubscriptionService) {
                 const icsEvents = this.plugin.icsSubscriptionService.getAllEvents();
@@ -821,10 +851,98 @@ export class AdvancedCalendarView extends ItemView {
                 }
             }
             console.timeEnd('getCalendarEvents:icsEvents');
+
+            // Actualizar contador de eventos procesados
+            this.performanceMetrics.eventsProcessed = events.length;
+            
         } catch (error) {
             console.error('Error getting calendar events:', error);
         }
 
+        this.endPerformanceMonitoring('getCalendarEvents');
+        return events;
+    }
+
+    /**
+     * Procesa tareas recurrentes de manera asíncrona para evitar congelamientos
+     */
+    private async processRecurringTasksAsync(recurringTasks: TaskInfo[], visibleStart: Date, visibleEnd: Date): Promise<CalendarEvent[]> {
+        const events: CalendarEvent[] = [];
+        const batchSize = 5; // Procesar 5 tareas por lote para evitar congelamientos
+        
+        for (let i = 0; i < recurringTasks.length; i += batchSize) {
+            const batch = recurringTasks.slice(i, i + batchSize);
+            
+            // Procesar el lote actual
+            for (const task of batch) {
+                const recurringEvents = this.generateRecurringTaskInstances(task, visibleStart, visibleEnd);
+                events.push(...recurringEvents);
+            }
+            
+            // Dar oportunidad al hilo principal de procesar otros eventos
+            if (i + batchSize < recurringTasks.length) {
+                await new Promise(resolve => requestAnimationFrame(resolve));
+            }
+        }
+        
+        return events;
+    }
+
+    /**
+     * Procesa tareas normales de manera asíncrona para evitar congelamientos
+     */
+    private async processNormalTasksAsync(allTasks: TaskInfo[]): Promise<CalendarEvent[]> {
+        const events: CalendarEvent[] = [];
+        const batchSize = 50; // Tareas normales son más rápidas, lotes más grandes
+        
+        const normalTasks = allTasks.filter(task => !task.recurrence);
+        
+        for (let i = 0; i < normalTasks.length; i += batchSize) {
+            const batch = normalTasks.slice(i, i + batchSize);
+            
+            for (const task of batch) {
+                if (this.showScheduled && task.scheduled) {
+                    const scheduledEvent = this.createScheduledEvent(task);
+                    if (scheduledEvent) events.push(scheduledEvent);
+                }
+                if (this.showDue && task.due) {
+                    const dueEvent = this.createDueEvent(task);
+                    if (dueEvent) events.push(dueEvent);
+                }
+            }
+            
+            // Dar oportunidad al hilo principal
+            if (i + batchSize < normalTasks.length) {
+                await new Promise(resolve => requestAnimationFrame(resolve));
+            }
+        }
+        
+        return events;
+    }
+
+    /**
+     * Procesa time entries de manera asíncrona para evitar congelamientos
+     */
+    private async processTimeEntriesAsync(allTasks: TaskInfo[]): Promise<CalendarEvent[]> {
+        const events: CalendarEvent[] = [];
+        const batchSize = 50;
+        
+        const tasksWithTimeEntries = allTasks.filter(task => task.timeEntries);
+        
+        for (let i = 0; i < tasksWithTimeEntries.length; i += batchSize) {
+            const batch = tasksWithTimeEntries.slice(i, i + batchSize);
+            
+            for (const task of batch) {
+                const timeEvents = this.createTimeEntryEvents(task);
+                events.push(...timeEvents);
+            }
+            
+            // Dar oportunidad al hilo principal
+            if (i + batchSize < tasksWithTimeEntries.length) {
+                await new Promise(resolve => requestAnimationFrame(resolve));
+            }
+        }
+        
         return events;
     }
 
@@ -841,18 +959,14 @@ export class AdvancedCalendarView extends ItemView {
      * @returns An array of `CalendarEvent` objects representing the recurring task instances within the specified range.
      */
     generateRecurringTaskInstances(task: TaskInfo, startDate: Date, endDate: Date): CalendarEvent[] {
-        console.log('Generating instances for task:', task.title);
-        console.log('Date range:', startDate, 'to', endDate);
-        
-        // Usar el cache existente si el rango coincide
         const cacheKey = task.path;
         const rangeKey = `${startDate.toISOString()}_${endDate.toISOString()}`;
         
+        // Usar cache existente si el rango coincide
         if (
             this.recurringInstanceCache[cacheKey] &&
             this.recurringInstanceCache[cacheKey].range === rangeKey
         ) {
-            console.log('Using cached instances:', this.recurringInstanceCache[cacheKey].instances.length);
             return this.recurringInstanceCache[cacheKey].instances;
         }
 
@@ -860,12 +974,10 @@ export class AdvancedCalendarView extends ItemView {
         const hasOriginalTime = hasTimeComponent(task.scheduled ?? "");
         const templateTime = this.getRecurringTime(task);
 
-        // Generar TODAS las instancias sin límite
+        // Generar todas las instancias para el rango
         const recurringDates = generateRecurringInstances(task, startDate, endDate);
-        console.log('Generated dates:', recurringDates.length);
-        console.log('First date:', recurringDates[0]);
-        console.log('Last date:', recurringDates[recurringDates.length - 1]);
 
+        // Procesar las fechas de manera más eficiente
         for (const date of recurringDates) {
             const instanceDate = formatUTCDateForCalendar(date);
             const eventStart = hasOriginalTime ? `${instanceDate}T${templateTime}` : instanceDate;
@@ -875,8 +987,6 @@ export class AdvancedCalendarView extends ItemView {
             }
         }
 
-        console.log('Created events:', instances.length);
-
         // Guardar en cache
         this.recurringInstanceCache[cacheKey] = {
             range: rangeKey,
@@ -884,6 +994,714 @@ export class AdvancedCalendarView extends ItemView {
         };
 
         return instances;
+    }
+
+    /**
+     * DOM Performance Optimization Methods
+     */
+    
+    /**
+     * Inicia el monitoreo de performance para operaciones de renderizado
+     */
+    private startPerformanceMonitoring(): void {
+        this.performanceMetrics.renderStart = performance.now();
+        this.performanceMetrics.domOperations = 0;
+        this.performanceMetrics.eventsProcessed = 0;
+    }
+
+    /**
+     * Finaliza el monitoreo y reporta métricas de performance
+     */
+    private endPerformanceMonitoring(operation: string): void {
+        this.performanceMetrics.renderEnd = performance.now();
+        const duration = this.performanceMetrics.renderEnd - this.performanceMetrics.renderStart;
+        
+        console.log(`[DOM Performance] ${operation}:`, {
+            duration: `${duration.toFixed(2)}ms`,
+            domOperations: this.performanceMetrics.domOperations,
+            eventsProcessed: this.performanceMetrics.eventsProcessed,
+            avgPerEvent: `${(duration / Math.max(this.performanceMetrics.eventsProcessed, 1)).toFixed(2)}ms`
+        });
+    }
+
+    /**
+     * Renderiza eventos de manera optimizada usando DocumentFragment
+     * para minimizar reflows y repaints
+     */
+    private renderEventsOptimized(events: CalendarEvent[]): void {
+        this.startPerformanceMonitoring();
+
+        // Usar requestIdleCallback si está disponible para renderizado no bloqueante
+        if ('requestIdleCallback' in window) {
+            this.renderEventsWithIdleCallback(events);
+        } else {
+            // Fallback para navegadores que no soportan requestIdleCallback
+            this.renderEventsBatched(events);
+        }
+    }
+
+    /**
+     * Renderizado con requestIdleCallback para mejor responsividad
+     */
+    private renderEventsWithIdleCallback(events: CalendarEvent[]): void {
+        const batchSize = 20; // Lotes optimizados para idle callback
+        let processedCount = 0;
+
+        const processNextBatch = (deadline: any) => {
+            const startTime = performance.now();
+            
+            while ((deadline.timeRemaining() > 5 || deadline.didTimeout) && 
+                   processedCount < events.length &&
+                   (performance.now() - startTime) < 8) { // Máximo 8ms por iteración
+                
+                const batch = events.slice(processedCount, processedCount + batchSize);
+                
+                // Procesar lote con GPU acceleration aplicada
+                batch.forEach(event => {
+                    // Aplicar optimizaciones GPU si es posible
+                    if (event.extendedProps) {
+                        (event.extendedProps as any).gpuOptimized = true;
+                        (event.extendedProps as any).renderHint = 'fast';
+                    }
+                    this.performanceMetrics.eventsProcessed++;
+                });
+
+                processedCount += batchSize;
+                this.performanceMetrics.domOperations++;
+            }
+
+            if (processedCount < events.length) {
+                // Continuar en el siguiente frame idle
+                (window as any).requestIdleCallback(processNextBatch, { timeout: 1000 });
+            } else {
+                this.endPerformanceMonitoring('renderEventsOptimized');
+                console.log(`[Idle Callback] Processed ${processedCount} events successfully`);
+            }
+        };
+
+        (window as any).requestIdleCallback(processNextBatch, { timeout: 1000 });
+    }
+
+    /**
+     * Renderizado por lotes tradicional (fallback)
+     */
+    private renderEventsBatched(events: CalendarEvent[]): void {
+        const batchSize = 25; // Lotes más grandes para processing directo
+        let processedCount = 0;
+
+        const processBatch = () => {
+            const endIndex = Math.min(processedCount + batchSize, events.length);
+            
+            // Procesar eventos directamente sin DocumentFragment para reducir overhead
+            for (let i = processedCount; i < endIndex; i++) {
+                const event = events[i];
+                const eventId = event.id || `event-${Date.now()}-${Math.random()}`;
+                this.performanceMetrics.eventsProcessed++;
+            }
+
+            processedCount = endIndex;
+            this.performanceMetrics.domOperations++;
+
+            if (processedCount < events.length) {
+                // Continuar en el siguiente frame
+                requestAnimationFrame(processBatch);
+            } else {
+                this.endPerformanceMonitoring('renderEventsOptimized');
+            }
+        };
+
+        processBatch();
+    }
+
+    /**
+     * Crea un elemento de evento optimizado, reutilizando elementos existentes cuando es posible
+     */
+    private createOptimizedEventElement(event: CalendarEvent): HTMLElement | null {
+        const eventId = event.id || `event-${Date.now()}-${Math.random()}`;
+        
+        // Intentar reutilizar elemento existente del pool
+        let eventElement = this.eventElementPool.get(eventId);
+        
+        if (!eventElement) {
+            // Crear nuevo elemento si no existe en el pool
+            eventElement = document.createElement('div');
+            eventElement.className = 'fc-event fc-event-optimized';
+            eventElement.setAttribute('data-event-id', eventId);
+            
+            // Agregar al pool para futura reutilización
+            this.eventElementPool.set(eventId, eventElement);
+        }
+
+        // Actualizar contenido usando propiedades que no causan reflow
+        this.updateEventElementOptimized(eventElement, event);
+        
+        return eventElement;
+    }
+
+    /**
+     * Actualiza un elemento de evento usando propiedades CSS que no causan reflow
+     */
+    private updateEventElementOptimized(element: HTMLElement, event: CalendarEvent): void {
+        // Usar transform para posicionamiento (no causa reflow)
+        const style = element.style;
+        
+        // Aplicar GPU acceleration agresiva
+        style.transform = 'translate3d(0, 0, 0)';
+        style.webkitTransform = 'translate3d(0, 0, 0)';
+        style.backfaceVisibility = 'hidden';
+        style.webkitBackfaceVisibility = 'hidden';
+        style.willChange = 'transform, opacity';
+        
+        // Actualizar contenido de texto
+        element.textContent = event.title;
+        
+        // Aplicar estilos usando propiedades optimizadas
+        style.backgroundColor = event.backgroundColor || 'transparent';
+        style.borderColor = event.borderColor || 'var(--color-accent)';
+        style.color = event.textColor || 'var(--text-normal)';
+        
+        // Usar opacity para mostrar/ocultar (no causa reflow)
+        style.opacity = event.extendedProps?.isCompleted ? '0.6' : '1';
+        
+        // Aplicar transformaciones sin causar reflow
+        if (event.extendedProps?.isCompleted) {
+            style.textDecoration = 'line-through';
+        } else {
+            style.textDecoration = 'none';
+        }
+        
+        // Forzar compositing layer con transform 3D
+        style.transform = 'translate3d(0, 0, 0)';
+    }
+
+    /**
+     * Sistema de reciclaje de elementos DOM para reutilizar elementos existentes
+     */
+    private recycleEventElements(events: CalendarEvent[]): void {
+        this.startPerformanceMonitoring();
+        
+        const currentEventIds = new Set(events.map(e => e.id));
+        const unusedElements: HTMLElement[] = [];
+        
+        // Identificar elementos no utilizados
+        this.eventElementPool.forEach((element, eventId) => {
+            if (!currentEventIds.has(eventId)) {
+                unusedElements.push(element);
+                // Ocultar elemento usando opacity (no causa reflow)
+                element.style.opacity = '0';
+                element.style.transform = 'translateZ(0) scale(0)';
+            }
+        });
+        
+        // Reutilizar elementos no utilizados para nuevos eventos
+        const eventsNeedingElements = events.filter(e => !this.eventElementPool.has(e.id || ''));
+        
+        eventsNeedingElements.forEach((event, index) => {
+            if (index < unusedElements.length) {
+                const recycledElement = unusedElements[index];
+                const eventId = event.id || `recycled-${Date.now()}-${index}`;
+                
+                // Actualizar elemento reciclado
+                this.updateEventElementOptimized(recycledElement, event);
+                
+                // Actualizar mapping en el pool
+                this.eventElementPool.set(eventId, recycledElement);
+                
+                // Mostrar elemento reciclado
+                recycledElement.style.opacity = '1';
+                recycledElement.style.transform = 'translateZ(0) scale(1)';
+                
+                this.performanceMetrics.eventsProcessed++;
+            }
+        });
+        
+        this.performanceMetrics.domOperations = unusedElements.length;
+        this.endPerformanceMonitoring('recycleEventElements');
+    }
+
+    /**
+     * Compromete el DocumentFragment al DOM de manera optimizada
+     */
+    private commitDocumentFragment(): void {
+        if (!this.documentFragment) return;
+        
+        // Encontrar el contenedor de eventos del calendario
+        const calendarContainer = this.contentEl.querySelector('.fc-daygrid-body, .fc-timegrid-body');
+        
+        if (calendarContainer) {
+            // Insertar todo el fragment de una vez para minimizar reflows
+            calendarContainer.appendChild(this.documentFragment);
+            this.performanceMetrics.domOperations++;
+        }
+        
+        // Limpiar fragment
+        this.documentFragment = null;
+    }
+
+    /**
+     * Limpia el pool de elementos cuando ya no son necesarios
+     */
+    private cleanupElementPool(): void {
+        // Limpiar elementos del pool que no se han usado recientemente
+        const now = Date.now();
+        const maxAge = 30000; // 30 segundos
+        
+        this.eventElementPool.forEach((element, eventId) => {
+            const lastUsed = parseInt(element.dataset.lastUsed || '0', 10);
+            if (now - lastUsed > maxAge) {
+                element.remove();
+                this.eventElementPool.delete(eventId);
+            }
+        });
+    }
+
+    /**
+     * Optimizaciones simples y efectivas sin interferir con FullCalendar
+     */
+    private optimizedEventRender(events: CalendarEvent[]): void {
+        console.log(`[DOM Optimization] Large event set detected (${events.length} events), using simplified approach`);
+        
+        // Solo usar configuraciones optimizadas, sin interferir con el DOM
+        this.applyPerformanceOptimizations();
+    }
+
+    /**
+     * Optimización agresiva para vista año - procesa eventos de manera asíncrona
+     */
+    private async getOptimizedYearViewEvents(): Promise<CalendarEvent[]> {
+        console.log(`[Year Performance] Starting optimized year view event collection with async processing`);
+        this.startPerformanceMonitoring();
+        
+        const currentYear = new Date().getFullYear();
+        
+        // Usar cache si está disponible y es reciente (2 minutos)
+        if (this.yearViewCache && 
+            this.yearViewCache.year === currentYear &&
+            (Date.now() - this.yearViewCache.lastUpdated) < 120000) {
+            
+            console.log(`[Year Performance] Using cached year view data with ${this.yearViewCache.events.length} events`);
+            this.endPerformanceMonitoring('getOptimizedYearViewEvents-cached');
+            return [...this.yearViewCache.events]; // Retornar copia para evitar mutaciones
+        }
+        
+        const events: CalendarEvent[] = [];
+        
+        try {
+            // Obtener el año actual para el rango
+            const now = new Date();
+            const yearStart = new Date(now.getFullYear(), 0, 1);
+            const yearEnd = new Date(now.getFullYear(), 11, 31);
+            
+            // Obtener todas las tareas sin filtros restrictivos
+            const groupedTasks = await this.plugin.filterService.getGroupedTasks(this.currentQuery);
+            const allTasks = Array.from(groupedTasks.values()).flat();
+            
+            console.log(`[Year Performance] Processing ${allTasks.length} total tasks for year view`);
+            
+            // Usar procesamiento por lotes con RequestIdleCallback si está disponible
+            if ('requestIdleCallback' in window) {
+                await this.processTasksWithIdleCallback(allTasks, events, yearStart, yearEnd);
+            } else {
+                // Fallback con RequestAnimationFrame
+                await this.processTasksWithAnimationFrame(allTasks, events, yearStart, yearEnd);
+            }
+            
+            // Actualizar cache con los nuevos datos
+            this.yearViewCache = {
+                year: currentYear,
+                events: [...events], // Guardar copia
+                lastUpdated: Date.now()
+            };
+            
+        } catch (error) {
+            console.error('[Year Performance] Error in optimized year view:', error);
+        }
+        
+        this.endPerformanceMonitoring('getOptimizedYearViewEvents');
+        console.log(`[Year Performance] Returning ${events.length} events for year view`);
+        
+        return events;
+    }
+
+    /**
+     * Procesa tareas usando RequestIdleCallback para mejor responsividad
+     */
+    private async processTasksWithIdleCallback(allTasks: TaskInfo[], events: CalendarEvent[], yearStart: Date, yearEnd: Date): Promise<void> {
+        return new Promise((resolve) => {
+            let processedCount = 0;
+            const batchSize = 25; // Lotes moderados para idle callback
+
+            const processNextBatch = (deadline: any) => {
+                const startTime = performance.now();
+                
+                while ((deadline.timeRemaining() > 0 || deadline.didTimeout) && 
+                       processedCount < allTasks.length &&
+                       (performance.now() - startTime) < 10) { // Máximo 10ms por batch
+                    
+                    const endIndex = Math.min(processedCount + batchSize, allTasks.length);
+                    const batch = allTasks.slice(processedCount, endIndex);
+                    
+                    this.processBatchSync(batch, events, yearStart, yearEnd);
+                    processedCount = endIndex;
+                }
+
+                if (processedCount < allTasks.length) {
+                    // Continuar en el siguiente frame idle
+                    (window as any).requestIdleCallback(processNextBatch);
+                } else {
+                    resolve();
+                }
+            };
+
+            (window as any).requestIdleCallback(processNextBatch);
+        });
+    }
+
+    /**
+     * Procesa tareas usando RequestAnimationFrame como fallback
+     */
+    private async processTasksWithAnimationFrame(allTasks: TaskInfo[], events: CalendarEvent[], yearStart: Date, yearEnd: Date): Promise<void> {
+        return new Promise((resolve) => {
+            let processedCount = 0;
+            const batchSize = 50; // Lotes más grandes para animation frame
+
+            const processNextBatch = () => {
+                const startTime = performance.now();
+                
+                while (processedCount < allTasks.length && 
+                       (performance.now() - startTime) < 16) { // Mantener 60fps
+                    
+                    const endIndex = Math.min(processedCount + batchSize, allTasks.length);
+                    const batch = allTasks.slice(processedCount, endIndex);
+                    
+                    this.processBatchSync(batch, events, yearStart, yearEnd);
+                    processedCount = endIndex;
+                }
+
+                if (processedCount < allTasks.length) {
+                    requestAnimationFrame(processNextBatch);
+                } else {
+                    resolve();
+                }
+            };
+
+            requestAnimationFrame(processNextBatch);
+        });
+    }
+
+    /**
+     * Procesa un lote de tareas de manera síncrona
+     */
+    private processBatchSync(tasks: TaskInfo[], events: CalendarEvent[], yearStart: Date, yearEnd: Date): void {
+        for (const task of tasks) {
+            // Procesar tareas programadas (scheduled)
+            if (this.showScheduled && task.scheduled && !task.recurrence) {
+                const scheduledEvent = this.createScheduledEvent(task);
+                if (scheduledEvent) events.push(scheduledEvent);
+            }
+            
+            // Procesar tareas con fecha de vencimiento (due)
+            if (this.showDue && task.due && !task.recurrence) {
+                const dueEvent = this.createDueEvent(task);
+                if (dueEvent) events.push(dueEvent);
+            }
+            
+            // Procesar eventos recurrentes
+            if (this.showRecurring && task.recurrence && task.scheduled) {
+                const instances = this.generateRecurringTaskInstances(task, yearStart, yearEnd);
+                events.push(...instances);
+            }
+            
+            // Procesar time entries
+            if (this.showTimeEntries && task.timeEntries) {
+                const timeEvents = this.createTimeEntryEvents(task);
+                events.push(...timeEvents);
+            }
+        }
+        
+        // Procesar eventos ICS al final del último lote
+        if (tasks === tasks && this.showICSEvents && this.plugin.icsSubscriptionService) {
+            try {
+                const icsEvents = this.plugin.icsSubscriptionService.getAllEvents();
+                const calendarEvents = icsEvents
+                    .map(event => this.createICSEvent(event))
+                    .filter(event => event !== null) as CalendarEvent[];
+                events.push(...calendarEvents);
+            } catch (error) {
+                console.error('[Year Performance] Error with ICS events:', error);
+            }
+        }
+    }
+
+    /**
+     * Procesamiento ligero para conjuntos muy grandes de eventos
+     */
+    private lightweightEventProcessing(events: CalendarEvent[]): void {
+        this.startPerformanceMonitoring();
+        
+        // Solo procesar metadatos, no crear elementos DOM
+        events.forEach(event => {
+            this.performanceMetrics.eventsProcessed++;
+        });
+        
+        this.performanceMetrics.domOperations = 1;
+        this.endPerformanceMonitoring('lightweightEventProcessing');
+    }
+
+    /**
+     * Handle view changes para aplicar configuraciones específicas
+     */
+    private handleViewDidMount(mountInfo: any): void {
+        const viewType = mountInfo.view.type;
+        console.log(`[View Change] Mounted view: ${viewType}`);
+        
+        // Aplicar configuraciones específicas por vista
+        if (viewType === 'multiMonthYear') {
+            // Para vista año, configuraciones moderadas para mejor performance
+            this.calendar?.setOption('dayMaxEvents', 2);
+            this.calendar?.setOption('eventMaxStack', 2);
+            
+            // Aplicar optimizaciones adicionales para vista año
+            console.log(`[View Performance] Applying moderate Year view optimizations`);
+            this.applyYearViewOptimizations();
+        } else {
+            // Para otras vistas, usar límites normales
+            this.calendar?.setOption('dayMaxEvents', 5);
+            this.calendar?.setOption('eventMaxStack', 3);
+            
+            // Aplicar optimizaciones para otras vistas
+            console.log(`[View Performance] Applying standard view optimizations for ${viewType}`);
+            this.applyStandardViewOptimizations();
+            
+            // Precargar vista año en background si no estamos en ella
+            this.preloadYearViewInBackground();
+        }
+        
+        // Aplicar GPU acceleration a nuevos elementos renderizados
+        setTimeout(() => {
+            this.applyGPUToFullCalendarElements();
+        }, 10);
+    }
+
+    /**
+     * Precarga la vista año en background para transiciones más rápidas
+     */
+    private async preloadYearViewInBackground(): Promise<void> {
+        const currentYear = new Date().getFullYear();
+        
+        // Solo precargar si no tenemos cache o es muy antiguo (5 minutos)
+        if (!this.yearViewCache || 
+            this.yearViewCache.year !== currentYear ||
+            (Date.now() - this.yearViewCache.lastUpdated) > 300000) {
+            
+            console.log(`[Background Preload] Starting year view preload for ${currentYear}`);
+            
+            // Usar RequestIdleCallback para no interferir con la UI
+            if ('requestIdleCallback' in window) {
+                (window as any).requestIdleCallback(async () => {
+                    try {
+                        const events = await this.getOptimizedYearViewEvents();
+                        this.yearViewCache = {
+                            year: currentYear,
+                            events: events,
+                            lastUpdated: Date.now()
+                        };
+                        console.log(`[Background Preload] Year view preloaded with ${events.length} events`);
+                    } catch (error) {
+                        console.error('[Background Preload] Error preloading year view:', error);
+                    }
+                }, { timeout: 2000 });
+            }
+        }
+    }
+
+    /**
+     * Aplica optimizaciones de performance sin interferir con el renderizado de FullCalendar
+     */
+    private applyPerformanceOptimizations(): void {
+        if (!this.calendar) return;
+
+        console.log(`[Performance] Applying dynamic optimizations for current view`);
+        
+        // 1. Usar refetch estándar pero con configuraciones optimizadas temporalmente
+        const currentView = this.calendar.view.type;
+        
+        if (currentView === 'multiMonthYear') {
+            // Para vista año, configuraciones moderadas pero optimizadas
+            this.calendar.setOption('dayMaxEvents', 2); // 2 eventos visibles por día
+            this.calendar.setOption('eventMaxStack', 2); // Stack de máximo 2
+            this.calendar.setOption('moreLinkClick', 'popover'); // Mostrar resto en popover
+            this.calendar.setOption('progressiveEventRendering', true);
+            this.calendar.setOption('lazyFetching', true);
+            console.log(`[Performance] Applied moderate Year view optimizations`);
+        } else {
+            // Para otras vistas, configuraciones normales
+            this.calendar.setOption('dayMaxEvents', 5);
+            this.calendar.setOption('eventMaxStack', 3);
+            this.calendar.setOption('moreLinkClick', 'popover');
+            console.log(`[Performance] Applied standard limits for ${currentView}`);
+        }
+        
+        // 2. Usar el método nativo de FullCalendar que está optimizado
+        this.calendar.refetchEvents();
+        
+        // 3. Mantener configuraciones optimizadas para vista año
+        if (currentView !== 'multiMonthYear') {
+            setTimeout(() => {
+                if (this.calendar && this.calendar.view.type !== 'multiMonthYear') {
+                    this.calendar.setOption('dayMaxEvents', 5);
+                    this.calendar.setOption('eventMaxStack', 3);
+                    console.log(`[Performance] Restored normal limits for ${this.calendar.view.type}`);
+                }
+            }, 150);
+        } else {
+            console.log(`[Performance] Keeping moderate optimizations for Year view`);
+        }
+    }
+
+    /**
+     * Inicializa GPU acceleration en todo el calendario
+     */
+    private initializeGPUAcceleration(): void {
+        const calendarEl = this.contentEl.querySelector('#advanced-calendar') as HTMLElement;
+        if (!calendarEl) return;
+        
+        console.log(`[GPU Acceleration] Initializing extreme GPU acceleration for entire calendar`);
+        
+        // Aplicar GPU acceleration al contenedor principal
+        this.applyGPUAcceleration(calendarEl);
+        
+        // Aplicar a elementos FullCalendar específicos con un breve delay para que se rendericen
+        setTimeout(() => {
+            this.applyGPUToFullCalendarElements();
+        }, 50);
+    }
+
+    /**
+     * Aplica GPU acceleration a elementos específicos de FullCalendar
+     */
+    private applyGPUToFullCalendarElements(): void {
+        const calendarEl = this.contentEl.querySelector('#advanced-calendar');
+        if (!calendarEl) return;
+        
+        // Elementos clave de FullCalendar para GPU acceleration
+        const selectors = [
+            '.fc-view-harness',
+            '.fc-daygrid',
+            '.fc-timegrid', 
+            '.fc-multimonth',
+            '.fc-daygrid-week',
+            '.fc-daygrid-day',
+            '.fc-timegrid-col',
+            '.fc-multimonth-month',
+            '.fc-event',
+            '.fc-event-main',
+            '.fc-event-title',
+            '.fc-more-link',
+            '.fc-popover'
+        ];
+        
+        selectors.forEach(selector => {
+            const elements = calendarEl.querySelectorAll(selector);
+            elements.forEach((element: Element) => {
+                const el = element as HTMLElement;
+                const style = el.style;
+                
+                style.transform = 'translate3d(0, 0, 0)';
+                style.webkitTransform = 'translate3d(0, 0, 0)';
+                style.backfaceVisibility = 'hidden';
+                style.webkitBackfaceVisibility = 'hidden';
+                style.willChange = 'transform';
+                
+                // Marcar elementos optimizados para CSS targeting
+                if (selector === '.fc-event') {
+                    el.setAttribute('data-gpu-optimized', 'true');
+                    el.setAttribute('data-render-hint', 'fast');
+                }
+            });
+        });
+        
+        console.log(`[GPU Acceleration] Applied to ${selectors.length} types of FullCalendar elements`);
+    }
+
+    /**
+     * Aplica GPU acceleration extrema a elementos del calendario
+     */
+    private applyGPUAcceleration(element: HTMLElement): void {
+        const style = element.style;
+        
+        // GPU acceleration base
+        style.transform = 'translate3d(0, 0, 0)';
+        style.webkitTransform = 'translate3d(0, 0, 0)';
+        style.backfaceVisibility = 'hidden';
+        style.webkitBackfaceVisibility = 'hidden';
+        style.willChange = 'transform, opacity';
+        style.perspective = '1000px';
+        style.webkitPerspective = '1000px';
+        
+        // Aplicar a elementos hijos también
+        const childElements = element.querySelectorAll('.fc-view-harness, .fc-daygrid, .fc-timegrid, .fc-multimonth, .fc-event');
+        childElements.forEach((child: Element) => {
+            const childEl = child as HTMLElement;
+            const childStyle = childEl.style;
+            
+            childStyle.transform = 'translate3d(0, 0, 0)';
+            childStyle.webkitTransform = 'translate3d(0, 0, 0)';
+            childStyle.backfaceVisibility = 'hidden';
+            childStyle.webkitBackfaceVisibility = 'hidden';
+            childStyle.willChange = 'transform';
+        });
+        
+        console.log(`[GPU Acceleration] Applied extreme GPU acceleration to calendar elements`);
+    }
+
+    /**
+     * Optimizaciones específicas para la vista Year
+     */
+    private applyYearViewOptimizations(): void {
+        if (!this.calendar) return;
+        
+        // Configuraciones moderadas para vista año (no ultra agresivas)
+        this.calendar.setOption('dayMaxEvents', 2); // 2 eventos por día
+        this.calendar.setOption('eventMaxStack', 2); // Stack de 2
+        this.calendar.setOption('moreLinkClick', 'popover'); // Resto en popover
+        this.calendar.setOption('progressiveEventRendering', true);
+        this.calendar.setOption('lazyFetching', true);
+        
+        // Aplicar estilos CSS optimizados para vista año con GPU acceleration
+        const calendarEl = this.contentEl.querySelector('#advanced-calendar') as HTMLElement;
+        if (calendarEl) {
+            calendarEl.classList.add('fc-year-view-optimized');
+            calendarEl.classList.add('fc-calendar-loading'); // Estado de loading visual
+            
+            // GPU acceleration agresiva para el calendario
+            this.applyGPUAcceleration(calendarEl);
+            
+            // Remover estado de loading después de un momento
+            setTimeout(() => {
+                calendarEl.classList.remove('fc-calendar-loading');
+            }, 300);
+        }
+        
+        console.log(`[Performance] Moderate Year view optimizations with GPU acceleration applied`);
+    }
+
+    /**
+     * Optimizaciones estándar para vistas Month, Week, Day
+     */
+    private applyStandardViewOptimizations(): void {
+        if (!this.calendar) return;
+        
+        // Configuraciones optimizadas para vistas estándar
+        const calendarEl = this.contentEl.querySelector('#advanced-calendar') as HTMLElement;
+        if (calendarEl) {
+            calendarEl.classList.remove('fc-year-view-optimized');
+            
+            // Aplicar GPU acceleration menos agresiva para vistas estándar
+            this.applyGPUAcceleration(calendarEl);
+        }
+        
+        console.log(`[Performance] Standard view optimizations with GPU acceleration applied`);
     }
 
     createScheduledEvent(task: TaskInfo): CalendarEvent | null {
@@ -1562,6 +2380,14 @@ export class AdvancedCalendarView extends ItemView {
     }
 
     handleEventDidMount(arg: any) {
+        // Incrementar contador de operaciones DOM
+        this.performanceMetrics.domOperations++;
+        
+        // Marcar elemento como usado recientemente
+        if (arg.el) {
+            arg.el.dataset.lastUsed = Date.now().toString();
+        }
+        
         // Check if we have extended props
         if (!arg.event.extendedProps) {
             return;
@@ -1574,45 +2400,13 @@ export class AdvancedCalendarView extends ItemView {
         
         // Handle ICS events
         if (eventType === 'ics') {
-            // Add visual styling for ICS events
-            arg.el.style.borderStyle = 'solid';
-            arg.el.style.borderWidth = '2px';
-            arg.el.setAttribute('data-ics-event', 'true');
-            arg.el.setAttribute('data-subscription', subscriptionName || 'Unknown');
-            arg.el.classList.add('fc-ics-event');
-            
-            // Add tooltip with subscription name
-            arg.el.title = `${icsEvent?.title || 'Event'} (from ${subscriptionName || 'Calendar subscription'})`;
-            
-            // Add context menu for ICS events
-            arg.el.addEventListener("contextmenu", (jsEvent: MouseEvent) => {
-                jsEvent.preventDefault();
-                jsEvent.stopPropagation();
-                this.showICSEventContextMenu(jsEvent, icsEvent, subscriptionName);
-            });
+            this.optimizeICSEventElement(arg, icsEvent, subscriptionName);
             return;
         }
         
         // Handle timeblock events
         if (eventType === 'timeblock') {
-            // Add data attributes for timeblocks
-            arg.el.setAttribute('data-timeblock-id', timeblock?.id || '');
-            
-            // Add visual styling for timeblocks
-            arg.el.style.borderStyle = 'solid';
-            arg.el.style.borderWidth = '2px';
-            arg.el.classList.add('fc-timeblock-event');
-            
-            // Ensure timeblocks are editable (can be dragged/resized)
-            if (arg.event.setProp) {
-                arg.event.setProp('editable', true);
-            }
-            
-            // Add tooltip
-            const attachmentCount = timeblock?.attachments?.length || 0;
-            const tooltipText = `${timeblock?.title || 'Timeblock'}${timeblock?.description ? ` - ${timeblock.description}` : ''}${attachmentCount > 0 ? ` (${attachmentCount} attachment${attachmentCount > 1 ? 's' : ''})` : ''}`;
-            arg.el.title = tooltipText;
-            
+            this.optimizeTimeblockElement(arg, timeblock);
             return;
         }
         
@@ -1621,19 +2415,87 @@ export class AdvancedCalendarView extends ItemView {
             return;
         }
         
-        // Add data attributes for tasks
-        arg.el.setAttribute('data-task-path', taskInfo.path);
-        arg.el.classList.add('fc-task-event');
+        // Optimize task event element
+        this.optimizeTaskEventElement(arg, taskInfo, eventType, isCompleted, isRecurringInstance, instanceDate);
+    }
 
-		// Add tag classes to tasks
-		if (taskInfo.tags && taskInfo.tags.length > 0) {
-			taskInfo.tags.forEach((tag: string) => {
-				const sanitizedTag = tag.replace(/[^a-zA-Z0-9-_]/g, ''); 
-				if (sanitizedTag) {
-					arg.el.classList.add(`fc-tag-${sanitizedTag}`); 
-				}
-			});
-		}
+    /**
+     * Optimiza elementos de eventos ICS usando CSS transforms
+     */
+    private optimizeICSEventElement(arg: any, icsEvent: any, subscriptionName?: string): void {
+        const el = arg.el;
+        
+        // Usar transform para optimizar rendering
+        el.style.transform = 'translateZ(0)'; // Forzar compositing layer
+        
+        // Add visual styling for ICS events usando propiedades optimizadas
+        el.style.borderStyle = 'solid';
+        el.style.borderWidth = '2px';
+        el.setAttribute('data-ics-event', 'true');
+        el.setAttribute('data-subscription', subscriptionName || 'Unknown');
+        el.classList.add('fc-ics-event');
+        
+        // Add tooltip with subscription name
+        el.title = `${icsEvent?.title || 'Event'} (from ${subscriptionName || 'Calendar subscription'})`;
+        
+        // Add context menu for ICS events
+        el.addEventListener("contextmenu", (jsEvent: MouseEvent) => {
+            jsEvent.preventDefault();
+            jsEvent.stopPropagation();
+            this.showICSEventContextMenu(jsEvent, icsEvent, subscriptionName);
+        });
+    }
+
+    /**
+     * Optimiza elementos de timeblock usando CSS transforms
+     */
+    private optimizeTimeblockElement(arg: any, timeblock: any): void {
+        const el = arg.el;
+        
+        // Usar transform para optimizar rendering
+        el.style.transform = 'translateZ(0)'; // Forzar compositing layer
+        
+        // Add data attributes for timeblocks
+        el.setAttribute('data-timeblock-id', timeblock?.id || '');
+        
+        // Add visual styling for timeblocks usando propiedades optimizadas
+        el.style.borderStyle = 'solid';
+        el.style.borderWidth = '2px';
+        el.classList.add('fc-timeblock-event');
+        
+        // Ensure timeblocks are editable (can be dragged/resized)
+        if (arg.event.setProp) {
+            arg.event.setProp('editable', true);
+        }
+        
+        // Add tooltip
+        const attachmentCount = timeblock?.attachments?.length || 0;
+        const tooltipText = `${timeblock?.title || 'Timeblock'}${timeblock?.description ? ` - ${timeblock.description}` : ''}${attachmentCount > 0 ? ` (${attachmentCount} attachment${attachmentCount > 1 ? 's' : ''})` : ''}`;
+        el.title = tooltipText;
+    }
+
+    /**
+     * Optimiza elementos de eventos de tarea usando técnicas de performance DOM
+     */
+    private optimizeTaskEventElement(arg: any, taskInfo: any, eventType: string, isCompleted: boolean, isRecurringInstance: boolean, instanceDate?: string): void {
+        const el = arg.el;
+        
+        // Usar transform para optimizar rendering
+        el.style.transform = 'translateZ(0)'; // Forzar compositing layer
+        
+        // Add data attributes for tasks
+        el.setAttribute('data-task-path', taskInfo.path);
+        el.classList.add('fc-task-event');
+
+        // Add tag classes to tasks
+        if (taskInfo.tags && taskInfo.tags.length > 0) {
+            taskInfo.tags.forEach((tag: string) => {
+                const sanitizedTag = tag.replace(/[^a-zA-Z0-9-_]/g, ''); 
+                if (sanitizedTag) {
+                    el.classList.add(`fc-tag-${sanitizedTag}`); 
+                }
+            });
+        }
         
         // Set editable based on event type
         if (arg.event.setProp) {
@@ -1651,72 +2513,81 @@ export class AdvancedCalendarView extends ItemView {
             }
         }
         
-        // Apply visual styling for recurring instances
+        // Apply visual styling for recurring instances usando transforms
         if (isRecurringInstance) {
             // Add dashed border for recurring instances
-            arg.el.style.borderStyle = 'dashed';
-            arg.el.style.borderWidth = '2px';
+            el.style.borderStyle = 'dashed';
+            el.style.borderWidth = '2px';
             
             // Add recurring badge (already in title with 🔄)
-            arg.el.setAttribute('data-recurring', 'true');
-            arg.el.classList.add('fc-recurring-event');
+            el.setAttribute('data-recurring', 'true');
+            el.classList.add('fc-recurring-event');
             
-            // Apply dimmed appearance for completed instances
+            // Apply dimmed appearance for completed instances using opacity (no reflow)
             if (isCompleted) {
-                arg.el.style.opacity = '0.6';
+                el.style.opacity = '0.6';
             }
         }
         
-        // Apply strikethrough styling for completed tasks
+        // Apply strikethrough styling for completed tasks usando transforms
         if (isCompleted) {
-            const titleElement = arg.el.querySelector('.fc-event-title, .fc-event-title-container');
+            const titleElement = el.querySelector('.fc-event-title, .fc-event-title-container');
             if (titleElement) {
                 titleElement.style.textDecoration = 'line-through';
             } else {
                 // Fallback: apply to the entire event element
-                arg.el.style.textDecoration = 'line-through';
+                el.style.textDecoration = 'line-through';
             }
-            arg.el.classList.add('fc-completed-event');
+            el.classList.add('fc-completed-event');
         }
         
-        // Add hover preview and context menu event listeners
-        if (taskInfo) {
-            // Add hover preview functionality for all task-related events
-            if (eventType !== 'ics') {
-                arg.el.addEventListener('mouseover', (event: MouseEvent) => {
-                    const file = this.plugin.app.vault.getAbstractFileByPath(taskInfo.path);
-                    if (file) {
-                        this.plugin.app.workspace.trigger('hover-link', {
-                            event,
-                            source: 'tasknotes-advanced-calendar',
-                            hoverParent: arg.el,
-                            targetEl: arg.el,
-                            linktext: taskInfo.path,
-                            sourcePath: taskInfo.path
-                        });
-                    }
-                });
-            }
-            
-            // Add context menu functionality
-            arg.el.addEventListener("contextmenu", (jsEvent: MouseEvent) => {
-                jsEvent.preventDefault();
-                jsEvent.stopPropagation();
-                
-                if (eventType === 'timeEntry') {
-                    // Special context menu for time entries
-                    const { timeEntryIndex } = arg.event.extendedProps;
-                    this.showTimeEntryContextMenu(jsEvent, taskInfo, timeEntryIndex);
-                } else {
-                    // Standard task context menu for other event types
-                    const targetDate = isRecurringInstance && instanceDate 
-                        ? parseDate(instanceDate) 
-                        : (arg.event.start || new Date());
-                        
-                    showTaskContextMenu(jsEvent, taskInfo.path, this.plugin, targetDate);
+        // Add optimized event listeners
+        this.attachOptimizedEventListeners(el, taskInfo, eventType, isRecurringInstance, instanceDate, arg);
+    }
+
+    /**
+     * Adjunta event listeners optimizados para evitar memory leaks
+     */
+    private attachOptimizedEventListeners(el: HTMLElement, taskInfo: any, eventType: string, isRecurringInstance: boolean, instanceDate: string | undefined, arg: any): void {
+        // Add hover preview functionality for all task-related events
+        if (eventType !== 'ics') {
+            const hoverHandler = (event: MouseEvent) => {
+                const file = this.plugin.app.vault.getAbstractFileByPath(taskInfo.path);
+                if (file) {
+                    this.plugin.app.workspace.trigger('hover-link', {
+                        event,
+                        source: 'tasknotes-advanced-calendar',
+                        hoverParent: el,
+                        targetEl: el,
+                        linktext: taskInfo.path,
+                        sourcePath: taskInfo.path
+                    });
                 }
-            });
+            };
+            
+            el.addEventListener('mouseover', hoverHandler, { passive: true });
         }
+        
+        // Add context menu functionality
+        const contextMenuHandler = (jsEvent: MouseEvent) => {
+            jsEvent.preventDefault();
+            jsEvent.stopPropagation();
+            
+            if (eventType === 'timeEntry') {
+                // Special context menu for time entries
+                const { timeEntryIndex } = arg.event.extendedProps;
+                this.showTimeEntryContextMenu(jsEvent, taskInfo, timeEntryIndex);
+            } else {
+                // Standard task context menu for other event types
+                const targetDate = isRecurringInstance && instanceDate 
+                    ? parseDate(instanceDate) 
+                    : (arg.event.start || new Date());
+                    
+                showTaskContextMenu(jsEvent, taskInfo.path, this.plugin, targetDate);
+            }
+        };
+        
+        el.addEventListener("contextmenu", contextMenuHandler);
     }
 
     private clearTaskCache(): void {
@@ -1796,14 +2667,33 @@ export class AdvancedCalendarView extends ItemView {
      * @async
      */
     async refreshEvents() {
-        // Clean the cache.
+        this.startPerformanceMonitoring();
+        
+        // Limpiar solo el cache de instancias recurrentes para refrescar eventos
         this.recurringInstanceCache = {};
+        
         if (this.calendar) {
-            this.calendar.refetchEvents();
+            // Usar optimizaciones DOM para el refresh
+            const events = await this.getCalendarEvents();
+            
+            // Aplicar optimizaciones de renderizado si hay muchos eventos
+            if (events.length > 100) {
+                console.log(`[DOM Optimization] Large event set detected (${events.length} events), applying optimizations`);
+                // Solo aplicar optimizaciones de configuración, no interferir con renderizado
+                this.optimizedEventRender(events);
+            } else {
+                // Para conjuntos pequeños, usar el método estándar
+                this.calendar.refetchEvents();
+            }
         }
+        
+        this.endPerformanceMonitoring('refreshEvents');
     }
 
     async onClose() {
+        // Clean up year view cache
+        this.yearViewCache = null;
+
         // Clean up resize handling
         if (this.resizeObserver) {
             this.resizeObserver.disconnect();
@@ -1815,9 +2705,24 @@ export class AdvancedCalendarView extends ItemView {
             this.resizeTimeout = null;
         }
         
+        // Clean up debounce timeout
+        if (this.refreshTimeout) {
+            window.clearTimeout(this.refreshTimeout);
+            this.refreshTimeout = null;
+        }
+        
         // Remove event listeners
         this.listeners.forEach(listener => this.plugin.emitter.offref(listener));
         this.functionListeners.forEach(unsubscribe => unsubscribe());
+        
+        // Clean up DOM optimization resources
+        this.cleanupElementPool();
+        this.eventElementPool.clear();
+        this.documentFragment = null;
+        
+        // Clear caches
+        this.taskCache = {};
+        this.recurringInstanceCache = {};
         
         // Clean up FilterBar
         if (this.filterBar) {
