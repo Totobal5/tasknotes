@@ -43,7 +43,8 @@ import {
     generateRecurringInstances,
     extractTimeblocksFromNote,
     timeblockToCalendarEvent,
-    updateTimeblockInDailyNote
+    updateTimeblockInDailyNote,
+    hexToRgba
 } from '../utils/helpers';
 
 interface CalendarEvent {
@@ -137,6 +138,13 @@ export class AdvancedCalendarView extends ItemView {
     // Performance optimization properties
     private refreshTimeout: number | null = null;
 
+    /**
+     * Constructor for the AdvancedCalendarView.
+     * Initializes the view with default settings and prepares it for rendering.
+     *
+     * @param leaf - The workspace leaf this view is attached to.
+     * @param plugin - The TaskNotesPlugin instance managing this view.
+     */
     constructor(leaf: WorkspaceLeaf, plugin: TaskNotesPlugin) {
         super(leaf);
         this.plugin = plugin;
@@ -161,19 +169,10 @@ export class AdvancedCalendarView extends ItemView {
         };
     }
 
-    // #region GETTERS
-    public getViewType(): string {
-        return ADVANCED_CALENDAR_VIEW_TYPE;
-    }
-
-    public getDisplayText(): string {
-        return 'Advanced Calendar';
-    }
-
-    public getIcon(): string {
-        return 'calendar-range';
-    }
-
+    /**
+     * Called when the view is opened.
+     * Initializes the calendar view, loads saved filter state, and sets up event listeners.
+     */
     public async onOpen() {
         // Wait for plugin to be fully initialized
         await this.plugin.onReady();
@@ -218,6 +217,74 @@ export class AdvancedCalendarView extends ItemView {
         // Re-initialize on window migration
         this.contentEl.onWindowMigrated(init);
     }
+
+    /**
+     * Registers event listeners for the calendar view.
+     * This includes handling task updates, time blocking toggles, and other relevant events.
+     */
+    public async onClose() {
+        // Clean up unified cache
+        this.unifiedEventCache = {};
+
+        // Clean up resize handling
+        if (this.resizeObserver) {
+            this.resizeObserver.disconnect();
+            this.resizeObserver = null;
+        }
+        
+        if (this.resizeTimeout) {
+            window.clearTimeout(this.resizeTimeout);
+            this.resizeTimeout = null;
+        }
+        
+        // Clean up debounce timeout
+        if (this.refreshTimeout) {
+            window.clearTimeout(this.refreshTimeout);
+            this.refreshTimeout = null;
+        }
+        
+        // Remove event listeners
+        this.listeners.forEach(listener => this.plugin.emitter.offref(listener));
+        this.functionListeners.forEach(unsubscribe => unsubscribe());
+        
+        // Clean up DOM optimization resources
+        this.cleanupElementPool();
+        this.eventElementPool.clear();
+        this.documentFragment = null;
+        
+        // Clear caches
+        this.taskCache = {};
+        this.recurringInstanceCache = {};
+        
+        // Clean up FilterBar
+        if (this.filterBar) {
+            this.filterBar.destroy();
+            this.filterBar = null;
+        }
+        
+        // Destroy calendar
+        if (this.calendar) {
+            this.calendar.destroy();
+            this.calendar = null;
+        }
+        
+        // Clean up
+        this.contentEl.empty();
+    }
+
+    // #region GETTERS
+    public getViewType(): string {
+        return ADVANCED_CALENDAR_VIEW_TYPE;
+    }
+
+    public getDisplayText(): string {
+        return 'Advanced Calendar';
+    }
+
+    public getIcon(): string {
+        return 'calendar-range';
+    }
+
 
     private getHeaderToolbarConfig() {
         // Hide FullCalendar header on mobile when collapsed
@@ -1693,7 +1760,7 @@ export class AdvancedCalendarView extends ItemView {
         console.log(`[GPU Acceleration] Applied extreme GPU acceleration to calendar elements`);
     }
 
-    createScheduledEvent(task: TaskInfo): CalendarEvent | null {
+    public createScheduledEvent(task: TaskInfo): CalendarEvent | null {
         if (!task.scheduled) return null;
         
         const hasTime = hasTimeComponent(task.scheduled);
@@ -1732,7 +1799,7 @@ export class AdvancedCalendarView extends ItemView {
         };
     }
 
-    createDueEvent(task: TaskInfo): CalendarEvent | null {
+    public createDueEvent(task: TaskInfo): CalendarEvent | null {
         if (!task.due) return null;
         
         const hasTime = hasTimeComponent(task.due);
@@ -1751,7 +1818,7 @@ export class AdvancedCalendarView extends ItemView {
         const borderColor = priorityConfig?.color || 'var(--color-orange)';
         
         // Create faded background color from priority color
-        const fadedBackground = this.hexToRgba(borderColor, 0.15);
+        const fadedBackground = hexToRgba(borderColor, 0.15);
         
         // Check if task is completed
         const isCompleted = this.plugin.statusManager.isCompletedStatus(task.status);
@@ -1774,19 +1841,7 @@ export class AdvancedCalendarView extends ItemView {
         };
     }
 
-    hexToRgba(hex: string, alpha: number): string {
-        // Remove # if present
-        hex = hex.replace('#', '');
-        
-        // Parse hex color
-        const r = parseInt(hex.substring(0, 2), 16);
-        const g = parseInt(hex.substring(2, 4), 16);
-        const b = parseInt(hex.substring(4, 6), 16);
-        
-        return `rgba(${r}, ${g}, ${b}, ${alpha})`;
-    }
-
-    createTimeEntryEvents(task: TaskInfo): CalendarEvent[] {
+    public createTimeEntryEvents(task: TaskInfo): CalendarEvent[] {
         if (!task.timeEntries) return [];
         
         // Check if task is completed
@@ -1813,7 +1868,7 @@ export class AdvancedCalendarView extends ItemView {
             }));
     }
 
-    createICSEvent(icsEvent: ICSEvent): CalendarEvent | null {
+    public createICSEvent(icsEvent: ICSEvent): CalendarEvent | null {
         try {
             // Get subscription info for styling
             const subscription = this.plugin.icsSubscriptionService.getSubscriptions()
@@ -1823,7 +1878,7 @@ export class AdvancedCalendarView extends ItemView {
                 return null;
             }
 
-            const backgroundColor = this.hexToRgba(subscription.color, 0.2);
+            const backgroundColor = hexToRgba(subscription.color, 0.2);
             const borderColor = subscription.color;
 
             return {
@@ -1848,13 +1903,13 @@ export class AdvancedCalendarView extends ItemView {
         }
     }
 
-    getRecurringTime(task: TaskInfo): string {
+    public getRecurringTime(task: TaskInfo): string {
         if (!task.scheduled) return '09:00'; // default
         const timePart = getTimePart(task.scheduled);
         return timePart || '09:00';
     }
 
-    createRecurringEvent(task: TaskInfo, eventStart: string, instanceDate: string, templateTime: string): CalendarEvent | null {
+    public createRecurringEvent(task: TaskInfo, eventStart: string, instanceDate: string, templateTime: string): CalendarEvent | null {
         const hasTime = hasTimeComponent(eventStart);
         
         // Calculate end time if time estimate is available
@@ -1898,7 +1953,7 @@ export class AdvancedCalendarView extends ItemView {
     }
 
     // Event handlers
-    handleDateSelect(selectInfo: any) {
+    public handleDateSelect(selectInfo: any) {
         const { start, end, allDay, jsEvent } = selectInfo;
         
         // Check if timeblocking is enabled and Shift key is held
@@ -1986,7 +2041,7 @@ export class AdvancedCalendarView extends ItemView {
     /**
      * Handle clicking on a date title to open/create daily note
      */
-    async handleDateTitleClick(date: Date) {
+    public async handleDateTitleClick(date: Date) {
         try {
             // Check if Daily Notes plugin is enabled
             if (!appHasDailyNotesPluginLoaded()) {
@@ -2024,7 +2079,7 @@ export class AdvancedCalendarView extends ItemView {
         }
     }
 
-    async getTimeblockEvents(): Promise<CalendarEvent[]> {
+    public async getTimeblockEvents(): Promise<CalendarEvent[]> {
         const events: CalendarEvent[] = [];
         
         try {
@@ -2075,7 +2130,7 @@ export class AdvancedCalendarView extends ItemView {
         return events;
     }
 
-    handleEventClick(clickInfo: any) {
+    public handleEventClick(clickInfo: any) {
         const { taskInfo, icsEvent, timeblock, eventType, subscriptionName } = clickInfo.event.extendedProps;
         const jsEvent = clickInfo.jsEvent;
         
@@ -2114,7 +2169,7 @@ export class AdvancedCalendarView extends ItemView {
         }
     }
 
-    async handleEventDrop(dropInfo: any) {
+    public async handleEventDrop(dropInfo: any) {
         const { taskInfo, timeblock, eventType, isRecurringInstance, originalDate } = dropInfo.event.extendedProps;
         
         if (eventType === 'timeEntry' || eventType === 'ics') {
@@ -2208,7 +2263,7 @@ export class AdvancedCalendarView extends ItemView {
         }
     }
 
-    async handleEventResize(resizeInfo: any) {
+    public async handleEventResize(resizeInfo: any) {
         const { taskInfo, timeblock, eventType, originalDate } = resizeInfo.event.extendedProps;
         
         if (eventType === 'timeblock') {
@@ -2286,7 +2341,7 @@ export class AdvancedCalendarView extends ItemView {
         }
     }
 
-    async handleExternalDrop(dropInfo: any) {
+    public async handleExternalDrop(dropInfo: any) {
         try {
             
             // Get task path from drag data transfer
@@ -2363,12 +2418,12 @@ export class AdvancedCalendarView extends ItemView {
      * Handle when FullCalendar tries to create an event from external drop
      * We prevent this since we handle the task scheduling ourselves
      */
-    handleEventReceive(info: any) {
+    public handleEventReceive(info: any) {
         // Remove the automatically created event since we handle scheduling ourselves
         info.event.remove();
     }
 
-    handleEventDidMount(arg: any) {
+    public handleEventDidMount(arg: any) {
         // Incrementar contador de operaciones DOM
         this.performanceMetrics.domOperations++;
         
@@ -2411,7 +2466,7 @@ export class AdvancedCalendarView extends ItemView {
     /**
      * Maneja el montaje de vistas para aplicar optimizaciones específicas usando cache unificado
      */
-    handleViewDidMount(mountInfo: any): void {
+    public handleViewDidMount(mountInfo: any): void {
         const viewType = mountInfo.view.type;
         console.log(`[View Mount] View mounted: ${viewType}`);
         
@@ -2604,7 +2659,7 @@ export class AdvancedCalendarView extends ItemView {
         this.taskCache = {};
     }
 
-    registerEvents(): void {
+    public registerEvents(): void {
         // Clean up any existing listeners
         this.listeners.forEach(listener => this.plugin.emitter.offref(listener));
         this.listeners = [];
@@ -2675,8 +2730,8 @@ export class AdvancedCalendarView extends ItemView {
      * and the calendar is updated to reflect the latest event data.
      * 
      * @async
-     */      
-    async refreshEvents() {
+     */
+    public async refreshEvents() {
         // Limpiar solo el cache de instancias recurrentes para refrescar eventos
         if (this.calendar) {
             // Usar optimizaciones DOM para el refresh
@@ -2690,61 +2745,9 @@ export class AdvancedCalendarView extends ItemView {
                 this.optimizedEventRender(events);
             } else {
                 // Para conjuntos pequeños, usar el método estándar
-                if (this.calendar) {
-                    this.calendar.refetchEvents();
-                }
+                this.calendar.refetchEvents();
             }
         }
-    }
-
-    public async onClose() {
-        // Clean up unified cache
-        this.unifiedEventCache = {};
-
-        // Clean up resize handling
-        if (this.resizeObserver) {
-            this.resizeObserver.disconnect();
-            this.resizeObserver = null;
-        }
-        
-        if (this.resizeTimeout) {
-            window.clearTimeout(this.resizeTimeout);
-            this.resizeTimeout = null;
-        }
-        
-        // Clean up debounce timeout
-        if (this.refreshTimeout) {
-            window.clearTimeout(this.refreshTimeout);
-            this.refreshTimeout = null;
-        }
-        
-        // Remove event listeners
-        this.listeners.forEach(listener => this.plugin.emitter.offref(listener));
-        this.functionListeners.forEach(unsubscribe => unsubscribe());
-        
-        // Clean up DOM optimization resources
-        this.cleanupElementPool();
-        this.eventElementPool.clear();
-        this.documentFragment = null;
-        
-        // Clear caches
-        this.taskCache = {};
-        this.recurringInstanceCache = {};
-        
-        // Clean up FilterBar
-        if (this.filterBar) {
-            this.filterBar.destroy();
-            this.filterBar = null;
-        }
-        
-        // Destroy calendar
-        if (this.calendar) {
-            this.calendar.destroy();
-            this.calendar = null;
-        }
-        
-        // Clean up
-        this.contentEl.empty();
     }
 
     private showICSEventInfo(icsEvent: ICSEvent, subscriptionName?: string): void {

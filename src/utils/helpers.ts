@@ -164,9 +164,6 @@ export function parseTime(timeStr: string): TimeInfo | null {
 }
 
 
-
-
-
 /**
  * Calculate default date based on configuration option
  */
@@ -1091,3 +1088,14 @@ export function filterEmptyProjects(projects: string[]): string[] {
 	});
 }
 
+export function hexToRgba(hex: string, alpha: number): string {
+	// Remove # if present
+	hex = hex.replace('#', '');
+	
+	// Parse hex color
+	const r = parseInt(hex.substring(0, 2), 16);
+	const g = parseInt(hex.substring(2, 4), 16);
+	const b = parseInt(hex.substring(4, 6), 16);
+	
+	return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}
