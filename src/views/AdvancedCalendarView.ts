@@ -60,13 +60,17 @@ interface CalendarEvent {
         taskInfo?: TaskInfo;
         icsEvent?: ICSEvent;
         timeblock?: TimeBlock;
-        eventType: 'scheduled' | 'due' | 'timeEntry' | 'recurring' | 'ics' | 'timeblock' | 'info';
+        eventType: 'scheduled' | 'due' | 'timeEntry' | 'recurring' | 'ics' | 'timeblock';
         isCompleted?: boolean;
         isRecurringInstance?: boolean;
-        instanceDate?: string; // YYYY-MM-DD for this specific occurrence
-        recurringTemplateTime?: string; // Original scheduled time
-        subscriptionName?: string; // For ICS events
-        attachments?: string[]; // For timeblocks
+        // YYYY-MM-DD for this specific occurrence
+        instanceDate?: string;
+        // Original scheduled time
+        recurringTemplateTime?: string;
+        // For ICS events
+        subscriptionName?: string;
+        // For timeblocks
+        attachments?: string[];
     };
 }
 
@@ -105,6 +109,23 @@ export class AdvancedCalendarView extends ItemView {
         }
     } = {};
 
+    // Task cache for filtered tasks
+    private taskCache: { [cacheKey: string]: TaskInfo[] } = {};
+
+    // Cache para instancias recurrentes específicas
+    private recurringInstanceCache: {
+        [taskPath: string]: {
+            range: string;
+            instances: CalendarEvent[];
+            lastUpdated: number;
+            loggedHit?: boolean;
+        }
+    } = {};
+
+    // DOM optimization pools
+    private eventElementPool: Map<string, HTMLElement> = new Map();
+    private documentFragment: DocumentFragment | null = null;
+
     // DOM Performance monitoring
     private performanceMetrics = {
         renderStart: 0,
@@ -140,6 +161,7 @@ export class AdvancedCalendarView extends ItemView {
         };
     }
 
+    // #region GETTERS
     public getViewType(): string {
         return ADVANCED_CALENDAR_VIEW_TYPE;
     }
@@ -179,24 +201,7 @@ export class AdvancedCalendarView extends ItemView {
             this.headerCollapsed = savedPreferences.headerCollapsed ?? true;
         }
         
-        const contentEl = this.contentEl;
-        contentEl.empty();
-        contentEl.addClass('tasknotes-plugin');
-        contentEl.addClass('advanced-calendar-view');
-
-        // Limpiar cachés antiguos de recurrencias al abrir la vista
-        this.cleanupOldRecurringCache();
-
-        // Create the calendar container
-        await this.renderView();
-        
-        // Register event listeners
-        this.registerEvents();
-        
-        // Initialize the calendar
-        await this.initializeCalendar();
-
-        this.contentEl.onWindowMigrated(async (win: Window) => {
+        const init = async () => {
             // Cleanup old calendar if it exists
             const contentEl = this.contentEl;
             contentEl.empty();
@@ -205,11 +210,103 @@ export class AdvancedCalendarView extends ItemView {
             // Re-render the view
             await this.renderView();
             this.registerEvents();
-            await this.initializeCalendar();
-        });
+            await this.initializeCalendar();            
+        }
+
+        await init();
+
+        // Re-initialize on window migration
+        this.contentEl.onWindowMigrated(init);
     }
 
-    async renderView() {
+    private getHeaderToolbarConfig() {
+        // Hide FullCalendar header on mobile when collapsed
+        if (this.headerCollapsed && window.innerWidth <= 768) {
+            return false; // This hides the entire header toolbar
+        }
+        
+        const toolbarConfig = {
+            left: 'prev,next today',
+            center: 'title',
+            right: 'refreshICS multiMonthYear,dayGridMonth,timeGridWeek,timeGridDay'
+        };
+        console.log('Header toolbar config:', toolbarConfig);
+        return toolbarConfig;
+    }
+
+    private getCustomButtons() {
+        const customButtons = {
+            refreshICS: {
+                text: 'Refresh',
+                hint: 'Refresh Calendar Subscriptions',
+                click: () => {
+                    console.log('Refresh ICS button clicked!');
+                    this.handleRefreshClick();
+                }
+            }
+        };
+        console.log('Custom buttons:', customButtons);
+        return customButtons;
+    }
+
+    /**
+     * Returns the configuration options for the calendar view.
+     * Each option represents a toggleable feature in the view, such as scheduled tasks,
+     * due dates, time entries, recurring tasks, and calendar subscriptions.
+     * If timeblocking is enabled in the plugin settings, the timeblocks option is also included.
+     *
+     * @returns An array of option objects, each containing:
+     *   - `id`: A unique identifier for the option.
+     *   - `label`: A human-readable label for the option.
+     *   - `value`: The current state (boolean) of the option.
+     */
+    public getViewOptionsConfig() {
+        const options = [
+            { id: 'scheduled', label: 'Scheduled tasks', value: this.showScheduled },
+            { id: 'due', label: 'Due dates', value: this.showDue },
+            { id: 'timeEntries', label: 'Time entries', value: this.showTimeEntries },
+            { id: 'recurring', label: 'Recurring tasks', value: this.showRecurring },
+            { id: 'icsEvents', label: 'Calendar subscriptions', value: this.showICSEvents }
+        ];
+        
+        // Add timeblocks option if enabled
+        if (this.plugin.settings.calendarViewSettings.enableTimeblocking) {
+            options.push({ id: 'timeblocks', label: 'Timeblocks', value: this.showTimeblocks });
+        }
+        
+        return options;
+    }
+
+    private getSlotLabelInterval(slotDuration: string): string {
+        // Show labels every hour, but at least as often as the slot duration
+        switch (slotDuration) {
+            case '00:15:00': return '01:00:00'; // 15-min slots, hourly labels
+            case '00:30:00': return '01:00:00'; // 30-min slots, hourly labels  
+            case '01:00:00': return '01:00:00'; // 1-hour slots, hourly labels
+            default: return '01:00:00';
+        }
+    }
+
+    private getTimeFormat(timeFormat: '12' | '24'): any {
+        if (timeFormat === '12') {
+            return {
+                hour: 'numeric',
+                minute: '2-digit',
+                omitZeroMinute: true,
+                hour12: true
+            };
+        } else {
+            return {
+                hour: '2-digit',
+                minute: '2-digit',
+                hour12: false
+            };
+        }
+    }    
+
+    // #endregion GETTERS
+
+    public async renderView() {
         const { contentEl } = this;
         contentEl.empty();
         
@@ -226,7 +323,7 @@ export class AdvancedCalendarView extends ItemView {
         });       
     }
 
-    async createHeader(container: HTMLElement) {
+    public async createHeader(container: HTMLElement) {
         const header = container.createDiv({ cls: 'advanced-calendar-view__header' });
         
         // Create mobile collapse toggle (only visible on mobile)
@@ -384,26 +481,7 @@ export class AdvancedCalendarView extends ItemView {
         this.filterBar.setViewOptions(options);
     }
 
-
-    // View options handling for FilterBar integration
-    getViewOptionsConfig() {
-        const options = [
-            { id: 'scheduled', label: 'Scheduled tasks', value: this.showScheduled },
-            { id: 'due', label: 'Due dates', value: this.showDue },
-            { id: 'timeEntries', label: 'Time entries', value: this.showTimeEntries },
-            { id: 'recurring', label: 'Recurring tasks', value: this.showRecurring },
-            { id: 'icsEvents', label: 'Calendar subscriptions', value: this.showICSEvents }
-        ];
-        
-        // Add timeblocks option if enabled
-        if (this.plugin.settings.calendarViewSettings.enableTimeblocking) {
-            options.push({ id: 'timeblocks', label: 'Timeblocks', value: this.showTimeblocks });
-        }
-        
-        return options;
-    }
-    
-    onViewOptionChange(optionId: string, enabled: boolean) {
+    public onViewOptionChange(optionId: string, enabled: boolean) {
         switch (optionId) {
             case 'scheduled':
                 this.showScheduled = enabled;
@@ -425,6 +503,7 @@ export class AdvancedCalendarView extends ItemView {
                 break;
         }
         
+        // Save preferences and refresh events
         this.saveViewPreferences();
         this.refreshEvents();
         
@@ -432,36 +511,6 @@ export class AdvancedCalendarView extends ItemView {
         this.setupViewOptions();
     }
     
-    private getHeaderToolbarConfig() {
-        // Hide FullCalendar header on mobile when collapsed
-        if (this.headerCollapsed && window.innerWidth <= 768) {
-            return false; // This hides the entire header toolbar
-        }
-        
-        const toolbarConfig = {
-            left: 'prev,next today',
-            center: 'title',
-            right: 'refreshICS multiMonthYear,dayGridMonth,timeGridWeek,timeGridDay'
-        };
-        console.log('Header toolbar config:', toolbarConfig);
-        return toolbarConfig;
-    }
-
-    private getCustomButtons() {
-        const customButtons = {
-            refreshICS: {
-                text: 'Refresh',
-                hint: 'Refresh Calendar Subscriptions',
-                click: () => {
-                    console.log('Refresh ICS button clicked!');
-                    this.handleRefreshClick();
-                }
-            }
-        };
-        console.log('Custom buttons:', customButtons);
-        return customButtons;
-    }
-
     private async handleRefreshClick() {
         if (!this.plugin.icsSubscriptionService) {
             new Notice('ICS subscription service not available');
@@ -484,9 +533,15 @@ export class AdvancedCalendarView extends ItemView {
         }
     }
 
-    
+    /**
+     * Clears the recurring instance cache to force regeneration of recurring events
+     */
+    private clearRecurringCache(): void {
+        this.recurringInstanceCache = {};
+        console.log('[Cache Clear] Recurring instance cache cleared');
+    }
 
-    openScheduleTasksModal() {
+    public openScheduleTasksModal() {
         const modal = new UnscheduledTasksSelectorModal(
             this.app,
             this.plugin,
@@ -499,7 +554,7 @@ export class AdvancedCalendarView extends ItemView {
         modal.open();
     }
 
-    async scheduleTask(task: TaskInfo, options?: ScheduleTaskOptions) {
+    public async scheduleTask(task: TaskInfo, options?: ScheduleTaskOptions) {
         try {
             let scheduledDate: string;
             
@@ -523,7 +578,114 @@ export class AdvancedCalendarView extends ItemView {
         }
     }
 
-    async initializeCalendar() {
+    private saveViewPreferences(): void {
+        const preferences: CalendarViewPreferences = {
+            showScheduled: this.showScheduled,
+            showDue: this.showDue,
+            showTimeEntries: this.showTimeEntries,
+            showRecurring: this.showRecurring,
+            showICSEvents: this.showICSEvents,
+            showTimeblocks: this.showTimeblocks,
+            headerCollapsed: this.headerCollapsed
+        };
+        this.plugin.viewStateManager.setViewPreferences(ADVANCED_CALENDAR_VIEW_TYPE, preferences);
+    }
+
+    /**
+     * Debounced refresh to prevent excessive re-renders during rapid view changes
+     */
+    private createDebouncedRefresh(): void {
+        if (this.refreshTimeout) {
+            window.clearTimeout(this.refreshTimeout);
+        }
+        
+        this.refreshTimeout = window.setTimeout(() => {
+            console.log('[View Change] Refreshing events after debounce');
+            this.refreshEvents();
+        }, 150); // 150ms debounce delay
+    }
+
+    private setupResizeHandling(): void {
+        if (!this.calendar) return;
+
+        // Clean up previous resize handling
+        if (this.resizeObserver) {
+            this.resizeObserver.disconnect();
+            this.resizeObserver = null;
+        }
+        if (this.resizeTimeout) {
+            window.clearTimeout(this.resizeTimeout);
+            this.resizeTimeout = null;
+        }
+
+        // Limpia listeners anteriores
+        this.functionListeners.forEach(unsubscribe => unsubscribe());
+        this.functionListeners = [];
+        this.listeners.forEach(listener => this.plugin.emitter.offref(listener));
+        this.listeners = [];
+
+        // Usa el window correcto (soporta popout)
+        const win = this.contentEl.ownerDocument.defaultView || window;
+
+        // Debounced resize handler
+        const debouncedResize = () => {
+            if (this.resizeTimeout) {
+                win.clearTimeout(this.resizeTimeout);
+            }
+            this.resizeTimeout = win.setTimeout(() => {
+                if (this.calendar) {
+                    this.calendar.updateSize();
+                }
+            }, 150);
+        };
+
+        // Use ResizeObserver to detect container size changes
+        if (win.ResizeObserver) {
+            this.resizeObserver = new win.ResizeObserver(debouncedResize);
+            const calendarContainer = this.contentEl.querySelector('.advanced-calendar-view__calendar-container');
+            if (calendarContainer) {
+                this.resizeObserver.observe(calendarContainer);
+            }
+        }
+
+        // Listen for workspace layout changes (Obsidian-specific)
+        const layoutChangeListener = this.plugin.app.workspace.on('layout-change', debouncedResize);
+        this.listeners.push(layoutChangeListener);
+
+        // Listen for window resize as fallback
+        win.addEventListener('resize', debouncedResize);
+        this.functionListeners.push(() => win.removeEventListener('resize', debouncedResize));
+
+        // Listen for active leaf changes that might affect calendar size
+        const activeLeafListener = this.plugin.app.workspace.on('active-leaf-change', (leaf) => {
+            if (leaf === this.leaf) {
+                setTimeout(debouncedResize, 100);
+            }
+        });
+        this.listeners.push(activeLeafListener);
+    }
+
+    /**
+     * Initializes the advanced calendar view within the application.
+     *
+     * This method locates the calendar container element, applies initial visibility and settings,
+     * and creates a new FullCalendar instance with custom configuration, plugins, and event handlers.
+     * It forces the initial view to "Year" (`multiMonthYear`), applies user settings, and sets up
+     * custom buttons and toolbar. After rendering, it switches to the "Month" view (`dayGridMonth`)
+     * to optimize loading and avoid infinite view change loops. GPU acceleration and event refreshing
+     * are also triggered post-render.
+     *
+     * @async
+     * @returns {Promise<void>} Resolves when the calendar has been initialized and rendered.
+     *
+     * @remarks
+     * - Hides the calendar during preloading for smoother UX.
+     * - Applies user-defined settings for appearance and behavior.
+     * - Handles dynamic event loading and view changes.
+     * - Limits event stacking and daily event display for clarity.
+     * - Ensures proper cleanup and error handling if the calendar element is not found.
+     */    
+    public async initializeCalendar(): Promise<void> {
         const calendarEl = this.contentEl.querySelector('#advanced-calendar');
         if (!calendarEl) {
             console.error('Calendar element not found');
@@ -627,175 +789,23 @@ export class AdvancedCalendarView extends ItemView {
         });
     }
 
-    private saveViewPreferences(): void {
-        const preferences: CalendarViewPreferences = {
-            showScheduled: this.showScheduled,
-            showDue: this.showDue,
-            showTimeEntries: this.showTimeEntries,
-            showRecurring: this.showRecurring,
-            showICSEvents: this.showICSEvents,
-            showTimeblocks: this.showTimeblocks,
-            headerCollapsed: this.headerCollapsed
-        };
-        this.plugin.viewStateManager.setViewPreferences(ADVANCED_CALENDAR_VIEW_TYPE, preferences);
-    }
-
-    private clearCaches(): void {
-        // Solo limpiar cache de tareas filtradas, NO el de recurrencias
-        // El cache de recurrencias debe persistir entre cambios de vista
-        this.taskCache = {};
-        this.lastViewType = null;
-        
-        console.log('[Cache] Cleared task cache but preserved recurring instance cache');
-    }
-
     /**
-     * Limpia el caché de recurrencias - solo usar cuando sea absolutamente necesario
-     * (ej: cuando cambian las tareas recurrentes o se fuerza un refresh completo)
-     */
-    private clearRecurringCache(): void {
-        this.recurringInstanceCache = {};
-        console.log('[Cache] Cleared recurring instance cache');
-    }
-
-    /**
-     * Limpia cachés antiguos de recurrencias (más de 24 horas)
-     */
-    private cleanupOldRecurringCache(): void {
-        const now = Date.now();
-        const maxAge = 24 * 60 * 60 * 1000; // 24 horas
-        
-        let cleanedCount = 0;
-        Object.keys(this.recurringInstanceCache).forEach(cacheKey => {
-            const cacheEntry = this.recurringInstanceCache[cacheKey];
-            if (cacheEntry && (now - cacheEntry.lastUpdated) > maxAge) {
-                delete this.recurringInstanceCache[cacheKey];
-                cleanedCount++;
-            }
-        });
-        
-        if (cleanedCount > 0) {
-            console.log(`[Cache] Cleaned up ${cleanedCount} old recurring cache entries`);
-        }
-    }
-
-    /**
-     * Debounced refresh to prevent excessive re-renders during rapid view changes
-     */
-    private createDebouncedRefresh(): void {
-        if (this.refreshTimeout) {
-            window.clearTimeout(this.refreshTimeout);
-        }
-        
-        this.refreshTimeout = window.setTimeout(() => {
-            console.log('[View Change] Refreshing events after debounce');
-            this.refreshEvents();
-        }, 150); // 150ms debounce delay
-    }
-
-    private setupResizeHandling(): void {
-        if (!this.calendar) return;
-
-        // Clean up previous resize handling
-        if (this.resizeObserver) {
-            this.resizeObserver.disconnect();
-            this.resizeObserver = null;
-        }
-        if (this.resizeTimeout) {
-            window.clearTimeout(this.resizeTimeout);
-            this.resizeTimeout = null;
-        }
-
-        // Limpia listeners anteriores
-        this.functionListeners.forEach(unsubscribe => unsubscribe());
-        this.functionListeners = [];
-        this.listeners.forEach(listener => this.plugin.emitter.offref(listener));
-        this.listeners = [];
-
-        // Usa el window correcto (soporta popout)
-        const win = this.contentEl.ownerDocument.defaultView || window;
-
-        // Debounced resize handler
-        const debouncedResize = () => {
-            if (this.resizeTimeout) {
-                win.clearTimeout(this.resizeTimeout);
-            }
-            this.resizeTimeout = win.setTimeout(() => {
-                if (this.calendar) {
-                    this.calendar.updateSize();
-                }
-            }, 150);
-        };
-
-        // Use ResizeObserver to detect container size changes
-        if (win.ResizeObserver) {
-            this.resizeObserver = new win.ResizeObserver(debouncedResize);
-            const calendarContainer = this.contentEl.querySelector('.advanced-calendar-view__calendar-container');
-            if (calendarContainer) {
-                this.resizeObserver.observe(calendarContainer);
-            }
-        }
-
-        // Listen for workspace layout changes (Obsidian-specific)
-        const layoutChangeListener = this.plugin.app.workspace.on('layout-change', debouncedResize);
-        this.listeners.push(layoutChangeListener);
-
-        // Listen for window resize as fallback
-        win.addEventListener('resize', debouncedResize);
-        this.functionListeners.push(() => win.removeEventListener('resize', debouncedResize));
-
-        // Listen for active leaf changes that might affect calendar size
-        const activeLeafListener = this.plugin.app.workspace.on('active-leaf-change', (leaf) => {
-            if (leaf === this.leaf) {
-                setTimeout(debouncedResize, 100);
-            }
-        });
-        this.listeners.push(activeLeafListener);
-    }
-
-    private getSlotLabelInterval(slotDuration: string): string {
-        // Show labels every hour, but at least as often as the slot duration
-        switch (slotDuration) {
-            case '00:15:00': return '01:00:00'; // 15-min slots, hourly labels
-            case '00:30:00': return '01:00:00'; // 30-min slots, hourly labels  
-            case '01:00:00': return '01:00:00'; // 1-hour slots, hourly labels
-            default: return '01:00:00';
-        }
-    }
-
-    private getTimeFormat(timeFormat: '12' | '24'): any {
-        if (timeFormat === '12') {
-            return {
-                hour: 'numeric',
-                minute: '2-digit',
-                omitZeroMinute: true,
-                hour12: true
-            };
-        } else {
-            return {
-                hour: '2-digit',
-                minute: '2-digit',
-                hour12: false
-            };
-        }
-    }
-
-    /**
-     * Retrieves and assembles all calendar events to be displayed in the calendar view.
+     * Retrieves and processes calendar events for the current calendar view.
      *
-     * This method gathers events from multiple sources, including:
-     * - Filtered and grouped tasks (both recurring and non-recurring), generating event instances as needed.
-     * - Time entry events associated with tasks, if enabled.
-     * - ICS subscription events, if enabled and available.
-     * - Timeblock events, if timeblocking is enabled in settings.
+     * This method performs the following steps:
+     * - Starts performance monitoring for diagnostics.
+     * - Attempts to retrieve events from a unified cache if available and valid.
+     * - Fetches and caches tasks based on the current query and calendar view type.
+     * - Normalizes the date range to cover the entire year for event collection.
+     * - Processes recurring tasks asynchronously to avoid UI freezing.
+     * - Processes normal (non-recurring) tasks asynchronously.
+     * - Optionally processes time entries and ICS events if enabled.
+     * - Updates performance metrics and caches the resulting events for future use.
+     * - Handles errors gracefully and logs them to the console.
      *
-     * The method applies user preferences for showing scheduled, due, recurring, time entry, ICS, and timeblock events.
-     * It normalizes date boundaries to UTC to ensure correct handling of recurring rules and date ranges.
-     * Errors encountered during event retrieval are logged to the console, but do not prevent other events from being processed.
-     *
-     * @returns {Promise<CalendarEvent[]>} A promise that resolves to an array of `CalendarEvent` objects to be displayed.
+     * @returns {Promise<CalendarEvent[]>} A promise that resolves to an array of processed calendar events.
      */
-    async getCalendarEvents(): Promise<CalendarEvent[]> {
+    public async getCalendarEvents(): Promise<CalendarEvent[]> {
         this.startPerformanceMonitoring();
         const events: CalendarEvent[] = [];
         
@@ -808,7 +818,8 @@ export class AdvancedCalendarView extends ItemView {
             // Verificar cache unificado
             const now = Date.now();
             const cachedData = this.unifiedEventCache[cacheKey];
-            if (cachedData && (now - cachedData.lastUpdated) < 120000) { // 2 minutos de validez
+            // Check if cache is valid.
+            if (cachedData) {
                 console.log(`[Unified Cache] Using cached events for ${viewType}: ${cachedData.events.length} events`);
                 this.endPerformanceMonitoring('getCalendarEvents-cached');
                 return [...cachedData.events]; // Retornar copia para evitar mutaciones
@@ -1033,7 +1044,7 @@ export class AdvancedCalendarView extends ItemView {
      * @param endDate - The end date of the range for which to generate recurring instances.
      * @returns An array of `CalendarEvent` objects representing the recurring task instances within the specified range.
      */
-    generateRecurringTaskInstances(task: TaskInfo, startDate: Date, endDate: Date): CalendarEvent[] {
+    public generateRecurringTaskInstances(task: TaskInfo, startDate: Date, endDate: Date): CalendarEvent[] {
         const cacheKey = task.path;
         const rangeKey = `${startDate.toISOString()}_${endDate.toISOString()}`;
         
@@ -2664,17 +2675,14 @@ export class AdvancedCalendarView extends ItemView {
      * and the calendar is updated to reflect the latest event data.
      * 
      * @async
-     */
+     */      
     async refreshEvents() {
-        this.startPerformanceMonitoring();
-        
         // Limpiar solo el cache de instancias recurrentes para refrescar eventos
-        this.recurringInstanceCache = {};
-        
         if (this.calendar) {
             // Usar optimizaciones DOM para el refresh
             const events = await this.getCalendarEvents();
-            
+            this.startPerformanceMonitoring();
+
             // Aplicar optimizaciones de renderizado si hay muchos eventos
             if (events.length > 100) {
                 console.log(`[DOM Optimization] Large event set detected (${events.length} events), applying optimizations`);
@@ -2682,14 +2690,14 @@ export class AdvancedCalendarView extends ItemView {
                 this.optimizedEventRender(events);
             } else {
                 // Para conjuntos pequeños, usar el método estándar
-                this.calendar.refetchEvents();
+                if (this.calendar) {
+                    this.calendar.refetchEvents();
+                }
             }
         }
-        
-        this.endPerformanceMonitoring('refreshEvents');
     }
 
-    async onClose() {
+    public async onClose() {
         // Clean up unified cache
         this.unifiedEventCache = {};
 
