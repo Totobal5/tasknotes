@@ -105,18 +105,6 @@ export class AdvancedCalendarView extends ItemView {
         }
     } = {};
 
-    // Persistent cache for recurring task instances - should survive view changes
-    private recurringInstanceCache: {
-        [taskId: string]: { range: string, instances: CalendarEvent[], lastUpdated: number, loggedHit?: boolean }
-    } = {};
-
-    // Temporary cache for filtered tasks - can be cleared on filter changes
-    private taskCache: {
-        [key: string]: TaskInfo[]
-    } = {};
-
-    private lastViewType: string | null = null;
-
     // DOM Performance monitoring
     private performanceMetrics = {
         renderStart: 0,
@@ -124,10 +112,6 @@ export class AdvancedCalendarView extends ItemView {
         domOperations: 0,
         eventsProcessed: 0
     };
-
-    // DOM optimization caches
-    private eventElementPool: Map<string, HTMLElement> = new Map();
-    private documentFragment: DocumentFragment | null = null;
 
     // Performance optimization properties
     private refreshTimeout: number | null = null;
@@ -156,19 +140,20 @@ export class AdvancedCalendarView extends ItemView {
         };
     }
 
-    getViewType(): string {
+    public getViewType(): string {
         return ADVANCED_CALENDAR_VIEW_TYPE;
     }
 
-    getDisplayText(): string {
+    public getDisplayText(): string {
         return 'Advanced Calendar';
     }
 
-    getIcon(): string {
+    public getIcon(): string {
         return 'calendar-range';
     }
 
-    async onOpen() {
+    public async onOpen() {
+        // Wait for plugin to be fully initialized
         await this.plugin.onReady();
         
         // Wait for migration to complete before initializing UI
@@ -607,6 +592,9 @@ export class AdvancedCalendarView extends ItemView {
             eventReceive: this.handleEventReceive.bind(this),
             eventDidMount: this.handleEventDidMount.bind(this),
             
+            // Handler para cambios de vista con optimizaciones unificadas
+            viewDidMount: this.handleViewDidMount.bind(this),
+            
             // Event sources will be added dynamically
             events: this.getCalendarEvents.bind(this),
 
@@ -848,12 +836,6 @@ export class AdvancedCalendarView extends ItemView {
             const year = calendarView?.currentStart.getFullYear() || new Date().getFullYear();
             const rawVisibleStart = new Date(Date.UTC(year, 0, 1));
             const rawVisibleEnd = new Date(Date.UTC(year, 11, 31, 23, 59, 59, 999));
-            
-            console.log('Year view range (UTC):', 
-                rawVisibleStart.toISOString(), 
-                'to', 
-                rawVisibleEnd.toISOString()
-            );
 
             const { utcStart: visibleStart, utcEnd: visibleEnd } = {
                 utcStart: rawVisibleStart,
@@ -1378,36 +1360,229 @@ export class AdvancedCalendarView extends ItemView {
         // 1. Usar refetch estándar pero con configuraciones optimizadas temporalmente
         const currentView = this.calendar.view.type;
         
-        if (currentView === 'multiMonthYear') {
-            // Para vista año, configuraciones moderadas pero optimizadas
-            this.calendar.setOption('dayMaxEvents', 2); // 2 eventos visibles por día
-            this.calendar.setOption('eventMaxStack', 2); // Stack de máximo 2
-            this.calendar.setOption('moreLinkClick', 'popover'); // Mostrar resto en popover
-            this.calendar.setOption('progressiveEventRendering', true);
-            this.calendar.setOption('lazyFetching', true);
-            console.log(`[Performance] Applied moderate Year view optimizations`);
-        } else {
-            // Para otras vistas, configuraciones normales
-            this.calendar.setOption('dayMaxEvents', 5);
-            this.calendar.setOption('eventMaxStack', 3);
-            this.calendar.setOption('moreLinkClick', 'popover');
-            console.log(`[Performance] Applied standard limits for ${currentView}`);
-        }
+        // Aplicar configuraciones optimizadas por tipo de vista
+        this.applyViewSpecificOptimizations(currentView);
         
         // 2. Usar el método nativo de FullCalendar que está optimizado
         this.calendar.refetchEvents();
         
-        // 3. Mantener configuraciones optimizadas para vista año
-        if (currentView !== 'multiMonthYear') {
-            setTimeout(() => {
-                if (this.calendar && this.calendar.view.type !== 'multiMonthYear') {
-                    this.calendar.setOption('dayMaxEvents', 5);
-                    this.calendar.setOption('eventMaxStack', 3);
-                    console.log(`[Performance] Restored normal limits for ${this.calendar.view.type}`);
+        // 3. Precargar cache para otras vistas en background
+        this.preloadCacheInBackground(currentView);
+    }
+
+    /**
+     * Aplica configuraciones específicas para cada tipo de vista usando el cache unificado
+     */
+    private applyViewSpecificOptimizations(viewType: string): void {
+        if (!this.calendar) return;
+        
+        console.log(`[Unified Optimization] Configuring ${viewType} view with cache-aware settings`);
+        
+        switch (viewType) {
+            case 'multiMonthYear':
+                // Configuraciones optimizadas para vista año
+                this.calendar.setOption('dayMaxEvents', 1);
+                this.calendar.setOption('eventMaxStack', 2);
+                this.calendar.setOption('moreLinkClick', 'popover');
+                this.calendar.setOption('progressiveEventRendering', true);
+                this.calendar.setOption('lazyFetching', true);
+                
+                // Aplicar estilos CSS optimizados
+                this.applyViewStyles('year');
+                break;
+                
+            case 'dayGridMonth':
+                // Configuraciones estándar para vista mes
+                this.calendar.setOption('dayMaxEvents', 5);
+                this.calendar.setOption('eventMaxStack', 3);
+                this.calendar.setOption('moreLinkClick', 'popover');
+                this.calendar.setOption('progressiveEventRendering', true);
+                
+                this.applyViewStyles('month');
+                break;
+                
+            case 'timeGridWeek':
+            case 'timeGridDay':
+                // Configuraciones para vistas de tiempo
+                this.calendar.setOption('dayMaxEvents', false); // Sin límite en vistas de tiempo
+                this.calendar.setOption('eventMaxStack', 10); // Límite alto para vistas de tiempo
+                this.calendar.setOption('progressiveEventRendering', false); // Mejor UX en vistas detalladas
+                
+                this.applyViewStyles('time');
+                break;
+                
+            default:
+                // Configuraciones por defecto
+                this.calendar.setOption('dayMaxEvents', 5);
+                this.calendar.setOption('eventMaxStack', 3);
+                this.applyViewStyles('default');
+        }
+    }
+
+    /**
+     * Aplica estilos CSS específicos para cada tipo de vista
+     */
+    private applyViewStyles(viewCategory: 'year' | 'month' | 'time' | 'default'): void {
+        const calendarEl = this.contentEl.querySelector('#advanced-calendar') as HTMLElement;
+        if (!calendarEl) return;
+        
+        // Remover clases anteriores
+        calendarEl.classList.remove('fc-view-year-optimized', 'fc-view-month-optimized', 'fc-view-time-optimized');
+        
+        switch (viewCategory) {
+            case 'year':
+                calendarEl.classList.add('fc-view-year-optimized');
+                this.applyGPUAcceleration(calendarEl);
+                break;
+            case 'month':
+                calendarEl.classList.add('fc-view-month-optimized');
+                this.applyGPUAcceleration(calendarEl);
+                break;
+            case 'time':
+                calendarEl.classList.add('fc-view-time-optimized');
+                // Menos GPU acceleration para vistas de tiempo para mejor scroll
+                break;
+            default:
+                // Aplicar optimizaciones base
+                this.applyGPUAcceleration(calendarEl);
+        }
+    }
+
+    /**
+     * Precarga cache para otras vistas en background usando RequestIdleCallback
+     */
+    private async preloadCacheInBackground(currentViewType: string): Promise<void> {
+        // Solo precargar si tenemos tiempo libre y el cache no está completo
+        if (!('requestIdleCallback' in window)) return;
+        
+        const viewTypesToPreload = ['multiMonthYear', 'dayGridMonth', 'timeGridWeek']
+            .filter(viewType => viewType !== currentViewType);
+        
+        console.log(`[Background Preload] Starting cache preload for ${viewTypesToPreload.length} view types`);
+        
+        (window as any).requestIdleCallback(async (deadline: any) => {
+            for (const viewType of viewTypesToPreload) {
+                if (deadline.timeRemaining() > 50) { // Al menos 50ms disponibles
+                    await this.preloadViewCache(viewType);
+                } else {
+                    // Continuar en el siguiente idle callback
+                    (window as any).requestIdleCallback(() => this.preloadViewCache(viewType), { timeout: 2000 });
                 }
-            }, 150);
-        } else {
-            console.log(`[Performance] Keeping moderate optimizations for Year view`);
+            }
+        }, { timeout: 3000 });
+    }
+
+    /**
+     * Precarga el cache para un tipo de vista específico
+     */
+    private async preloadViewCache(viewType: string): Promise<void> {
+        const cacheKey = `${viewType}_${this.currentQuery.id}`;
+        const cachedData = this.unifiedEventCache[cacheKey];
+        
+        // Solo precargar si no existe cache o es muy antiguo (más de 5 minutos)
+        if (!cachedData || (Date.now() - cachedData.lastUpdated) > 300000) {
+            console.log(`[Background Preload] Preloading cache for ${viewType}`);
+            
+            try {
+                // Generar eventos para esta vista específica
+                const events = await this.generateEventsForView(viewType);
+                
+                // Guardar en cache
+                this.unifiedEventCache[cacheKey] = {
+                    events: [...events],
+                    lastUpdated: Date.now(),
+                    viewType: viewType,
+                    dateRange: {
+                        start: new Date().toISOString(),
+                        end: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString() // 1 año
+                    }
+                };
+                
+                console.log(`[Background Preload] Cached ${events.length} events for ${viewType}`);
+            } catch (error) {
+                console.error(`[Background Preload] Error preloading ${viewType}:`, error);
+            }
+        }
+    }
+
+    /**
+     * Genera eventos para un tipo de vista específico sin cambiar la vista actual
+     */
+    private async generateEventsForView(viewType: string): Promise<CalendarEvent[]> {
+        const events: CalendarEvent[] = [];
+        
+        try {
+            // Obtener tareas usando el query actual
+            const groupedTasks = await this.plugin.filterService.getGroupedTasks(this.currentQuery);
+            const allTasks = Array.from(groupedTasks.values()).flat();
+            
+            // Usar rango apropiado según el tipo de vista
+            const { startDate, endDate } = this.getDateRangeForView(viewType);
+            
+            // Procesar tareas de manera similar a getCalendarEvents pero sin cache
+            const recurringTasks = allTasks.filter(task => task.recurrence && task.scheduled && this.showRecurring);
+            const recurringEvents = await this.processRecurringTasksAsync(recurringTasks, startDate, endDate);
+            events.push(...recurringEvents);
+            
+            const normalEvents = await this.processNormalTasksAsync(allTasks);
+            events.push(...normalEvents);
+            
+            if (this.showTimeEntries) {
+                const timeEvents = await this.processTimeEntriesAsync(allTasks);
+                events.push(...timeEvents);
+            }
+            
+            if (this.showICSEvents && this.plugin.icsSubscriptionService) {
+                const icsEvents = this.plugin.icsSubscriptionService.getAllEvents();
+                for (const icsEvent of icsEvents) {
+                    const calendarEvent = this.createICSEvent(icsEvent);
+                    if (calendarEvent) events.push(calendarEvent);
+                }
+            }
+            
+        } catch (error) {
+            console.error(`Error generating events for view ${viewType}:`, error);
+        }
+        
+        return events;
+    }
+
+    /**
+     * Obtiene el rango de fechas apropiado para cada tipo de vista
+     */
+    private getDateRangeForView(viewType: string): { startDate: Date; endDate: Date } {
+        const now = new Date();
+        
+        switch (viewType) {
+            case 'multiMonthYear':
+                return {
+                    startDate: new Date(now.getFullYear(), 0, 1),
+                    endDate: new Date(now.getFullYear(), 11, 31, 23, 59, 59, 999)
+                };
+            case 'dayGridMonth':
+                return {
+                    startDate: new Date(now.getFullYear(), now.getMonth(), 1),
+                    endDate: new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59, 999)
+                };
+            case 'timeGridWeek':
+                const startOfWeek = new Date(now);
+                startOfWeek.setDate(now.getDate() - now.getDay());
+                const endOfWeek = new Date(startOfWeek);
+                endOfWeek.setDate(startOfWeek.getDate() + 6);
+                endOfWeek.setHours(23, 59, 59, 999);
+                return { startDate: startOfWeek, endDate: endOfWeek };
+            case 'timeGridDay':
+                const startOfDay = new Date(now);
+                startOfDay.setHours(0, 0, 0, 0);
+                const endOfDay = new Date(now);
+                endOfDay.setHours(23, 59, 59, 999);
+                return { startDate: startOfDay, endDate: endOfDay };
+            default:
+                // Default: rango del año completo
+                return {
+                    startDate: new Date(now.getFullYear(), 0, 1),
+                    endDate: new Date(now.getFullYear(), 11, 31, 23, 59, 59, 999)
+                };
         }
     }
 
@@ -2220,6 +2395,27 @@ export class AdvancedCalendarView extends ItemView {
         
         // Optimize task event element
         this.optimizeTaskEventElement(arg, taskInfo, eventType, isCompleted, isRecurringInstance, instanceDate);
+    }
+
+    /**
+     * Maneja el montaje de vistas para aplicar optimizaciones específicas usando cache unificado
+     */
+    handleViewDidMount(mountInfo: any): void {
+        const viewType = mountInfo.view.type;
+        console.log(`[View Mount] View mounted: ${viewType}`);
+        
+        // Aplicar optimizaciones específicas para esta vista
+        this.applyViewSpecificOptimizations(viewType);
+        
+        // Precargar cache para otras vistas en background
+        this.preloadCacheInBackground(viewType);
+        
+        // Aplicar GPU acceleration después del montaje
+        setTimeout(() => {
+            this.applyGPUToFullCalendarElements();
+        }, 10);
+        
+        console.log(`[View Mount] Applied unified optimizations for ${viewType}`);
     }
 
     /**
