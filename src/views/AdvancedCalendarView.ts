@@ -817,7 +817,7 @@ export class AdvancedCalendarView extends ItemView {
             start: startDate,
             end: endDate,
             allDay: !hasTime,
-            backgroundColor: 'transparent',
+            backgroundColor: 'var(--background-secondary)',
             borderColor: borderColor,
             textColor: borderColor,
             editable: true, // Tasks are also editable

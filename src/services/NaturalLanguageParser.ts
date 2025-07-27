@@ -2,23 +2,7 @@ import { format, isValid } from 'date-fns';
 import { StatusConfig, PriorityConfig } from '../types';
 import * as chrono from 'chrono-node';
 import { RRule } from 'rrule';
-
-export interface ParsedTaskData {
-    title: string;
-    details?: string;
-    dueDate?: string;
-    scheduledDate?: string;
-    dueTime?: string;
-    scheduledTime?: string;
-    priority?: string;
-    status?: string;
-    tags: string[];
-    contexts: string[];
-    projects: string[];
-    recurrence?: string;
-    estimate?: number; // in minutes
-    isCompleted?: boolean;
-}
+import { INaturalLanguageParser, ParsedTaskData } from './INaturalLanguageParser';
 
 interface RegexPattern {
     regex: RegExp;
@@ -30,7 +14,7 @@ interface RegexPattern {
  * This refined version centralizes date parsing, pre-compiles regexes for performance,
  * and uses a more declarative pattern-matching approach for maintainability.
  */
-export class NaturalLanguageParser {
+export class NaturalLanguageParser implements INaturalLanguageParser {
     private readonly statusPatterns: RegexPattern[];
     private readonly priorityPatterns: RegexPattern[];
     private readonly defaultToScheduled: boolean;
@@ -145,13 +129,11 @@ export class NaturalLanguageParser {
             result.projects.push(...projectMatches.map(project => project.substring(1)));
             workingText = this.cleanupWhitespace(workingText.replace(/\+[\w/]+/g, ''));
         }
-        
         return workingText;
     }
 
-
     /**
-     * Pre-builds priority regex patterns from configuration for efficiency.
+     * English-specific priority patterns
      */
     private buildPriorityPatterns(configs: PriorityConfig[]): RegexPattern[] {
         if (configs.length > 0) {
@@ -160,7 +142,7 @@ export class NaturalLanguageParser {
                 { regex: new RegExp(`\\b${this.escapeRegex(config.label)}\\b`, 'i'), value: config.value }
             ]);
         }
-        // Fallback patterns - order matters, most specific first
+        // English fallback patterns - order matters, most specific first
         return [
             { regex: /\b(urgent|critical|highest)\b/i, value: 'urgent' },
             { regex: /\b(high)\b/i, value: 'high' },
@@ -193,7 +175,7 @@ export class NaturalLanguageParser {
     }
 
     /**
-     * Pre-builds status regex patterns from configuration for efficiency.
+     * English-specific status patterns
      */
     private buildStatusPatterns(configs: StatusConfig[]): RegexPattern[] {
         if (configs.length > 0) {
@@ -202,7 +184,7 @@ export class NaturalLanguageParser {
                 { regex: new RegExp(`\\b${this.escapeRegex(config.label)}\\b`, 'i'), value: config.value }
             ]);
         }
-        // Fallback patterns
+        // English fallback patterns
         return [
             { regex: /\b(todo|to do|open)\b/i, value: 'open' },
             { regex: /\b(in progress|in-progress|doing)\b/i, value: 'in-progress' },
